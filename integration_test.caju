@@ -1,0 +1,164 @@
+# Tests against a real PostgreSQL: PG_TEST_DSN=postgres://user:password@127.0.0.1:5432/db caju test
+# (tools/test-db.sh starts one in Docker). Without PG_TEST_DSN they are skipped.
+import { describe, it, skip, expect, before_each } from "std/testing"
+import "std/os"
+import "std/strings"
+import "pg"
+
+let DSN = os.getenv("PG_TEST_DSN")
+
+fn test(title: str, body: fn()) {
+  if DSN == "" {
+    skip(title, body)
+  } else {
+    it(title, body)
+  }
+}
+
+fn db() -> *pg.Conn {
+  c, err := pg.connect(DSN)
+  if err != nil { panic(err.Error()) }
+  return c
+}
+
+describe("pg against PostgreSQL", fn() {
+  before_each(fn() {
+    if DSN == "" { return }
+    c := db()
+    _, err := c.exec("drop table if exists caju_items; create table caju_items (id serial primary key, name text unique not null, price numeric(10,2), qty int, ok boolean, data bytea, meta jsonb, at timestamptz default now())", []any{})
+    if err != nil { panic(err.Error()) }
+    c.close()
+  })
+
+  test("connects (SCRAM-SHA-256) and reads the server's parameters", fn() {
+    c := db()
+    expect(c.parameter_status("server_encoding")).to_equal("UTF8")
+    expect(len(c.parameter_status("server_version")) > 0).to_be_true()
+    c.close()
+  })
+
+  test("refuses a wrong password with the server's error", fn() {
+    cfg, _ := pg.parse_dsn(DSN)
+    cfg.password = "wrong"
+    _, err := pg.connect_config(cfg)
+    expect(err != nil).to_be_true()
+    expect(err.Error()).to_contain("28P01")
+  })
+
+  test("inserts with parameters and reads typed values back", fn() {
+    c := db()
+    res, err := c.exec("insert into caju_items (name, price, qty, ok, data, meta) values ($1, $2, $3, $4, $5, $6), ($7, $8, $9, $10, $11, $12)",
+      []any{"caju", "12.50", 3, true, pg.bytes("\x00\x01\x7f"), "{\"cor\": \"vermelho\"}", "castanha", nil, nil, false, nil, nil})
+    expect(err == nil).to_be_true()
+    expect(res.rows_affected).to_equal(2)
+    rows, qerr := c.query("select id, name, price, qty, ok, data, meta from caju_items order by id", []any{})
+    expect(qerr == nil).to_be_true()
+    expect(rows.len()).to_equal(2)
+    expect(rows.next()).to_be_true()
+    expect(rows.get_int("id")).to_equal(1)
+    expect(rows.get_str("name")).to_equal("caju")
+    expect(rows.get("price")).to_equal("12.50")
+    expect(rows.get_num("price")).to_equal(12.5)
+    expect(rows.get("qty")).to_equal(3)
+    expect(rows.get("ok")).to_equal(true)
+    expect(rows.get("data")).to_equal("\x00\x01\x7f")
+    expect(rows.get_str("meta")).to_equal("{\"cor\": \"vermelho\"}")
+    expect(rows.next()).to_be_true()
+    expect(rows.is_null("price")).to_be_true()
+    expect(rows.get("qty")).to_equal(nil)
+    expect(rows.get_bool("ok")).to_equal(false)
+    expect(rows.next()).to_be_false()
+    c.close()
+  })
+
+  test("keeps the arguments out of the SQL", fn() {
+    c := db()
+    evil := "x'); drop table caju_items; --"
+    _, err := c.exec("insert into caju_items (name) values ($1)", []any{evil})
+    expect(err == nil).to_be_true()
+    row, rerr := c.query_row("select name from caju_items where name = $1", []any{evil})
+    expect(rerr == nil).to_be_true()
+    expect(row.get_str("name")).to_equal(evil)
+    c.close()
+  })
+
+  test("reports the server's errors with their SQLSTATE and keeps working", fn() {
+    c := db()
+    c.exec("insert into caju_items (name) values ($1)", []any{"caju"})
+    _, err := c.exec("insert into caju_items (name) values ($1)", []any{"caju"})
+    expect(err != nil).to_be_true()
+    pe, ok := err.(*pg.PgError)
+    expect(ok).to_be_true()
+    expect(pe.code).to_equal("23505")
+    _, serr := c.query("select nonsense from nowhere", []any{})
+    expect(serr.Error()).to_contain("42P01")
+    row, rerr := c.query_row("select count(*) as n from caju_items", []any{})
+    expect(rerr == nil).to_be_true()
+    expect(row.get_int("n")).to_equal(1)
+    c.close()
+  })
+
+  test("runs several statements without arguments", fn() {
+    c := db()
+    res, err := c.exec("insert into caju_items (name) values ('a'); insert into caju_items (name) values ('b'); update caju_items set qty = 1", []any{})
+    expect(err == nil).to_be_true()
+    expect(res.rows_affected).to_equal(2)
+    c.close()
+  })
+
+  test("commits and rolls back transactions", fn() {
+    c := db()
+    err := c.transaction(fn(tx: *pg.Conn) -> error {
+      tx.exec("insert into caju_items (name) values ($1)", []any{"kept"})
+      return nil
+    })
+    expect(err == nil).to_be_true()
+    terr := c.transaction(fn(tx: *pg.Conn) -> error {
+      tx.exec("insert into caju_items (name) values ($1)", []any{"dropped"})
+      expect(tx.in_transaction()).to_be_true()
+      return errors.New("changed my mind")
+    })
+    expect(terr.Error()).to_equal("changed my mind")
+    expect(c.in_transaction()).to_be_false()
+    rows, _ := c.query("select name from caju_items order by name", []any{})
+    names := []str{}
+    for _, m := range rows.maps() { names = append(names, m["name"].(str)) }
+    expect(strings.join(names, ",")).to_equal("kept")
+    c.close()
+  })
+
+  test("reuses the connections of a pool", fn() {
+    p, err := pg.open(DSN, 2)
+    expect(err == nil).to_be_true()
+    for i := 0; i < 20; i++ {
+      _, e := p.exec("insert into caju_items (name, qty) values ($1, $2)", []any{"item " + str(i), i})
+      expect(e == nil).to_be_true()
+    }
+    row, _ := p.query_row("select count(*) as n, sum(qty) as total from caju_items", []any{})
+    expect(row.get_int("n")).to_equal(20)
+    expect(row.get_int("total")).to_equal(190)
+    open, idle := p.stats()
+    expect(open).to_equal(1)
+    expect(idle).to_equal(1)
+    p.close()
+  })
+
+  test("reads a large result (many messages, split across reads)", fn() {
+    c := db()
+    rows, err := c.query("select g as n, repeat('caju', 50) as s from generate_series(1, 20000) g", []any{})
+    expect(err == nil).to_be_true()
+    expect(rows.len()).to_equal(20000)
+    total := 0
+    while rows.next() { total += rows.get_int("n") }
+    expect(total).to_equal(200010000)
+    c.close()
+  })
+
+  test("handles text in UTF-8", fn() {
+    c := db()
+    row, _ := c.query_row("select $1::text as t, length($1::text) as n", []any{"caju é 好"})
+    expect(row.get_str("t")).to_equal("caju é 好")
+    expect(row.get_int("n")).to_equal(8)
+    c.close()
+  })
+})

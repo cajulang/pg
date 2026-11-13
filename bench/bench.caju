@@ -1,0 +1,29 @@
+# The same work as bench.mjs (node-postgres), with this client: PG_DSN=... caju run bench/bench.caju
+import "std/os"
+import "../pg"
+dsn := os.getenv("PG_DSN")
+t := fn() -> num { return num(os.nanotime()) / 1000000.0 }
+t0 := t()
+c, err := pg.connect(dsn)
+if err != nil { panic(err.Error()) }
+connect := t() - t0
+c.exec("drop table if exists bench; create table bench (id int primary key, name text, price float8)", []any{})
+t0 = t()
+c.begin()
+for i := 0; i < 1000; i++ { c.exec("insert into bench values ($1, $2, $3)", []any{i, "item " + str(i), num(i) * 1.5}) }
+c.commit()
+inserts := t() - t0
+t0 = t()
+sum := 0.0
+for i := 0; i < 2000; i++ {
+  r, _ := c.query_row("select name, price from bench where id = $1", []any{i % 1000})
+  sum += r.get_num("price")
+}
+selects := t() - t0
+t0 = t()
+big, _ := c.query("select g as n, 'row ' || g as s, g * 0.5 as f from generate_series(1, 100000) g", []any{})
+total := 0
+while big.next() { total += big.get_int("n") }
+bigms := t() - t0
+c.close()
+print("{\"connect\":" + str(connect) + ",\"inserts\":" + str(inserts) + ",\"selects\":" + str(selects) + ",\"big\":" + str(bigms) + ",\"check\":[" + str(sum) + "," + str(total) + "]}")

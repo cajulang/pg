@@ -1,0 +1,37 @@
+# A tour of pg: PG_DSN=postgres://caju:caju-test@127.0.0.1:55432/caju caju run examples/demo.caju
+import "std/os"
+import "../pg"
+
+dsn := os.getenv("PG_DSN")
+if dsn == "" { dsn = "postgres://caju:caju-test@127.0.0.1:55432/caju" }
+db, err := pg.connect(dsn)
+if err != nil {
+  print("connect:", err.Error())
+  os.exit(1)
+}
+print("connected to PostgreSQL", db.parameter_status("server_version"))
+
+db.exec("drop table if exists fruits; create table fruits (id serial primary key, name text not null, price numeric(6,2), ripe boolean)", []any{})
+for _, f := range [][]any{[]any{"caju", "4.50", true}, []any{"manga", "3.20", false}, []any{"acerola", nil, true}} {
+  db.exec("insert into fruits (name, price, ripe) values ($1, $2, $3)", f)
+}
+
+rows, _ := db.query("select id, name, price, ripe from fruits where ripe = $1 order by id", []any{true})
+while rows.next() {
+  price := "no price"
+  if !rows.is_null("price") { price = rows.get_str("price") }
+  print(rows.get_int("id"), rows.get_str("name"), price)
+}
+
+err = db.transaction(fn(tx: *pg.Conn) -> error {
+  res, e := tx.exec("update fruits set price = price * 2 where name = $1", []any{"caju"})
+  if e != nil { return e }
+  print("updated", res.rows_affected, "row")
+  return nil
+})
+row, _ := db.query_row("select price from fruits where name = $1", []any{"caju"})
+print("caju now costs", row.get_str("price"))
+
+_, err = db.exec("insert into fruits (name) values ($1)", []any{nil})
+if pe, ok := err.(*pg.PgError); ok { print("refused:", pe.code, pe.message) }
+db.close()

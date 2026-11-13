@@ -1,0 +1,821 @@
+# pg: a PostgreSQL client for Caju, speaking the frontend/backend protocol (version 3) over TCP.
+#
+#   db, err := pg.connect("postgres://app:secret@127.0.0.1:5432/shop")
+#   rows, err := db.query("select id, name from products where price < $1", []any{10.5})
+#   while rows.next() { print(rows.get_int("id"), rows.get_str("name")) }
+#   res, err := db.exec("update products set price = $1 where id = $2", []any{9.9, 7})
+#   print(res.rows_affected)
+#
+# Authentication: trust, password, md5 and SCRAM-SHA-256 (PostgreSQL's default). Queries with
+# arguments use the extended protocol (each $n is sent apart from the SQL: no injection); exec
+# without arguments uses the simple protocol, which runs several statements. Values come back as
+# Caju values: int, num, bool, str (text, bytea's bytes, json, dates...), or nil for NULL.
+# No TLS: use it on a private network or through a tunnel (sslmode=disable).
+import "std/net"
+import "std/strings"
+import "std/strconv"
+import "std/crypto"
+import "std/base64"
+import "std/hex"
+import rawbytes "std/bytes"
+
+# ---------------------------------------------------------------------------------------------
+# Connection settings
+
+export struct Config {
+  host: str
+  port: int
+  user: str
+  password: str
+  database: str
+  application_name: str
+}
+
+# postgres://user:password@host:port/database?application_name=x (also postgresql://), or the
+# key=value form: "host=127.0.0.1 port=5432 user=app password=secret dbname=shop"
+export fn parse_dsn(dsn: str) -> (*Config, error) {
+  c := &Config{host: "127.0.0.1", port: 5432, user: "postgres", application_name: "caju-pg"}
+  if strings.has_prefix(dsn, "postgres://") || strings.has_prefix(dsn, "postgresql://") {
+    rest := dsn[strings.index(dsn, "://") + 3:]
+    query := ""
+    q := strings.index(rest, "?")
+    if q >= 0 {
+      query = rest[q + 1:]
+      rest = rest[0:q]
+    }
+    slash := strings.index(rest, "/")
+    if slash >= 0 {
+      c.database = unescape(rest[slash + 1:])
+      rest = rest[0:slash]
+    }
+    at := strings.last_index(rest, "@")
+    if at >= 0 {
+      cred := rest[0:at]
+      rest = rest[at + 1:]
+      colon := strings.index(cred, ":")
+      if colon >= 0 {
+        c.user = unescape(cred[0:colon])
+        c.password = unescape(cred[colon + 1:])
+      } else {
+        c.user = unescape(cred)
+      }
+    }
+    colon := strings.last_index(rest, ":")
+    if colon >= 0 {
+      p, err := strconv.atoi(rest[colon + 1:])
+      if err != nil { return nil, errors.New("pg: bad port in \"" + dsn + "\"") }
+      c.port = p
+      rest = rest[0:colon]
+    }
+    if rest != "" { c.host = rest }
+    if query != "" {
+      for _, kv := range strings.split(query, "&") {
+        e := strings.index(kv, "=")
+        if e < 0 { continue }
+        err := c.set(kv[0:e], unescape(kv[e + 1:]))
+        if err != nil { return nil, err }
+      }
+    }
+  } else {
+    for _, kv := range strings.fields(dsn) {
+      e := strings.index(kv, "=")
+      if e < 0 { return nil, errors.New("pg: bad setting \"" + kv + "\"") }
+      err := c.set(kv[0:e], kv[e + 1:])
+      if err != nil { return nil, err }
+    }
+  }
+  if c.database == "" { c.database = c.user }
+  return c, nil
+}
+
+fn (c: *Config) set(key: str, value: str) -> error {
+  switch key {
+  case "host": c.host = value
+  case "port":
+    p, err := strconv.atoi(value)
+    if err != nil { return errors.New("pg: bad port \"" + value + "\"") }
+    c.port = p
+  case "user": c.user = value
+  case "password": c.password = value
+  case "dbname": c.database = value
+  case "application_name": c.application_name = value
+  case "sslmode":
+    if value != "disable" && value != "allow" && value != "prefer" { return errors.New("pg: TLS is not supported (sslmode=" + value + ")") }
+  }
+  return nil
+}
+
+# %XX escapes of a URL
+fn unescape(s: str) -> str {
+  if !strings.contains(s, "%") { return s }
+  b := &strings.Builder{}
+  i := 0
+  while i < len(s) {
+    if int(s[i]) == '%' && i + 2 < len(s) {
+      v, err := strconv.parse_int(s[i + 1:i + 3], 16)
+      if err == nil {
+        b.write_byte(v)
+        i += 3
+        continue
+      }
+    }
+    b.write_byte(int(s[i]))
+    i++
+  }
+  return b.string()
+}
+
+# ---------------------------------------------------------------------------------------------
+# Errors
+
+# an error reported by the server: code is the SQLSTATE ("23505": unique violation...)
+export struct PgError {
+  severity: str
+  code: str
+  message: str
+  detail: str
+  hint: str
+  position: str
+}
+
+export fn (e: *PgError) Error() -> str {
+  s := "pg: " + e.severity + ": " + e.message + " (SQLSTATE " + e.code + ")"
+  if e.detail != "" { s = s + ": " + e.detail }
+  return s
+}
+
+fn parse_error(body: str) -> *PgError {
+  e := &PgError{}
+  i := 0
+  while i < len(body) && int(body[i]) != 0 {
+    field := int(body[i])
+    j := i + 1
+    while j < len(body) && int(body[j]) != 0 { j++ }
+    v := body[i + 1:j]
+    switch field {
+    case 'S': e.severity = v
+    case 'C': e.code = v
+    case 'M': e.message = v
+    case 'D': e.detail = v
+    case 'H': e.hint = v
+    case 'P': e.position = v
+    }
+    i = j + 1
+  }
+  return e
+}
+
+# ---------------------------------------------------------------------------------------------
+# Messages: building
+
+fn int32(b: *strings.Builder, v: int) {
+  b.write_byte((v >> 24) & 255)
+  b.write_byte((v >> 16) & 255)
+  b.write_byte((v >> 8) & 255)
+  b.write_byte(v & 255)
+}
+
+fn int16(b: *strings.Builder, v: int) {
+  b.write_byte((v >> 8) & 255)
+  b.write_byte(v & 255)
+}
+
+fn cstr(b: *strings.Builder, s: str) {
+  b.write(s)
+  b.write_byte(0)
+}
+
+# a message: its type byte, its length (counting itself) and its body
+export fn message(kind: int, body: str) -> str {
+  b := &strings.Builder{}
+  if kind != 0 { b.write_byte(kind) }
+  int32(b, len(body) + 4)
+  b.write(body)
+  return b.string()
+}
+
+fn get32(s: str, i: int) -> int {
+  v := (int(s[i]) << 24) | (int(s[i + 1]) << 16) | (int(s[i + 2]) << 8) | int(s[i + 3])
+  if v >= 0x80000000 { v -= 0x100000000 }
+  return v
+}
+
+fn get16(s: str, i: int) -> int { return (int(s[i]) << 8) | int(s[i + 1]) }
+
+# ---------------------------------------------------------------------------------------------
+# Values: Caju values as parameters (text format), and columns back to Caju values
+
+# a parameter in the text format; ok false for NULL
+export fn encode(v: any) -> (str, bool) {
+  switch x := v.(type) {
+  case nil: return "", false
+  case bool:
+    if x { return "t", true }
+    return "f", true
+  case int: return str(x), true
+  case num: return str(x), true
+  case str: return x, true
+  case *Bytea: return "\\x" + hex.encode(x.data), true
+  }
+  return str(v), true
+}
+
+# bytes to store in a bytea column: pg.bytes(data)
+export struct Bytea {
+  data: str
+}
+
+export fn bytes(data: str) -> *Bytea { return &Bytea{data: data} }
+
+# the type OIDs the client turns into Caju values
+const BOOL = 16
+const BYTEA = 17
+const INT8 = 20
+const INT2 = 21
+const INT4 = 23
+const OID = 26
+const FLOAT4 = 700
+const FLOAT8 = 701
+
+# a column's text as a Caju value of its type
+export fn decode(text: str, oid: int) -> any {
+  switch oid {
+  case BOOL: return text == "t"
+  case INT2, INT4, INT8, OID:
+    vi, ierr := strconv.atoi(text)
+    if ierr == nil { return vi }
+  case FLOAT4, FLOAT8:
+    if text == "NaN" || text == "Infinity" || text == "-Infinity" { return text }
+    vf, ferr := strconv.parse_float(text)
+    if ferr == nil { return vf }
+  case BYTEA:
+    if strings.has_prefix(text, "\\x") {
+      vb, berr := hex.decode(text[2:])
+      if berr == nil { return vb }
+    }
+  }
+  # numeric (exact: as text), text, varchar, json, dates, uuid, arrays...
+  return text
+}
+
+# ---------------------------------------------------------------------------------------------
+# SCRAM-SHA-256 (RFC 5802, RFC 7677)
+
+fn xor(a: str, b: str) -> str {
+  out := &strings.Builder{}
+  for i := 0; i < len(a); i++ { out.write_byte(int(a[i]) ^ int(b[i])) }
+  return out.string()
+}
+
+fn attr(msg: str, key: str) -> str {
+  for _, part := range strings.split(msg, ",") {
+    if strings.has_prefix(part, key + "=") { return part[len(key) + 1:] }
+  }
+  return ""
+}
+
+# the client's final message and the signature the server must answer with, for the client's
+# first message (without its "n,," header) and the server's first message
+export fn scram_final(password: str, client_first_bare: str, server_first: str) -> (str, str, error) {
+  nonce := attr(server_first, "r")
+  salt, err := base64.decode(attr(server_first, "s"))
+  if err != nil { return "", "", errors.New("pg: SCRAM: bad salt") }
+  iterations, ierr := strconv.atoi(attr(server_first, "i"))
+  if ierr != nil || iterations < 1 { return "", "", errors.New("pg: SCRAM: bad iteration count") }
+  if !strings.has_prefix(nonce, attr(client_first_bare, "r")) { return "", "", errors.New("pg: SCRAM: the server's nonce does not extend ours") }
+  salted := crypto.pbkdf2_sha256(password, salt, iterations, 32)
+  client_key := crypto.hmac_sha256(salted, "Client Key")
+  stored_key := crypto.sha256(client_key)
+  without_proof := "c=biws,r=" + nonce
+  auth := client_first_bare + "," + server_first + "," + without_proof
+  proof := xor(client_key, crypto.hmac_sha256(stored_key, auth))
+  server_sig := crypto.hmac_sha256(crypto.hmac_sha256(salted, "Server Key"), auth)
+  return without_proof + ",p=" + base64.encode(proof), base64.encode(server_sig), nil
+}
+
+# ---------------------------------------------------------------------------------------------
+# The connection
+
+export struct Column {
+  name: str
+  oid: int
+}
+
+export struct Conn {
+  sock: *net.Conn
+  buf: *rawbytes.Buffer   # what the server sent and was not read yet, from pos
+  pos: int
+  status: int          # 'I' idle, 'T' in a transaction, 'E' in a failed transaction
+  params: map[str]str  # the server's parameters (server_version, TimeZone...)
+  pid: int
+  closed: bool
+}
+
+export fn connect(dsn: str) -> (*Conn, error) {
+  cfg, err := parse_dsn(dsn)
+  if err != nil { return nil, err }
+  return connect_config(cfg)
+}
+
+export fn connect_config(cfg: *Config) -> (*Conn, error) {
+  host := cfg.host
+  if host == "localhost" { host = "127.0.0.1" }
+  sock, err := net.dial(host, cfg.port)
+  if err != nil { return nil, err }
+  sock.set_nodelay()
+  c := &Conn{sock: sock, params: map[str]str{}, status: 'I', buf: rawbytes.new_buffer(65536)}
+  # the startup message: protocol 3.0, then name/value pairs
+  b := &strings.Builder{}
+  int32(b, 196608)
+  cstr(b, "user")
+  cstr(b, cfg.user)
+  cstr(b, "database")
+  cstr(b, cfg.database)
+  cstr(b, "application_name")
+  cstr(b, cfg.application_name)
+  cstr(b, "client_encoding")
+  cstr(b, "UTF8")
+  b.write_byte(0)
+  werr := c.send(message(0, b.string()))
+  if werr != nil { return nil, werr }
+  aerr := c.authenticate(cfg)
+  if aerr != nil {
+    c.close()
+    return nil, aerr
+  }
+  return c, nil
+}
+
+fn (c: *Conn) send(data: str) -> error {
+  if c.closed { return errors.New("pg: the connection is closed") }
+  err := c.sock.write(data)
+  if err != nil {
+    c.closed = true
+    return err
+  }
+  return nil
+}
+
+# a byte-exact piece of a string (Caju's s[a:b] replaces bytes that are not UTF-8, and the
+# protocol is binary: lengths, OIDs, salts)
+fn cut(s: str, lo: int, hi: int) -> str {
+  b := &strings.Builder{}
+  for i := lo; i < hi; i++ { b.write_byte(int(s[i])) }
+  return b.string()
+}
+
+fn (c: *Conn) buf32(at: int) -> int {
+  b := c.buf
+  v := (b.get(at) << 24) | (b.get(at + 1) << 16) | (b.get(at + 2) << 8) | b.get(at + 3)
+  if v >= 0x80000000 { v -= 0x100000000 }
+  return v
+}
+
+# the next message from the server: its type and body
+fn (c: *Conn) receive() -> (int, str, error) {
+  while c.buf.len() - c.pos < 5 || c.buf.len() - c.pos < 1 + c.buf32(c.pos + 1) {
+    if c.pos > 0 {
+      rest := c.buf.slice(c.pos, c.buf.len())
+      c.buf.reset()
+      c.buf.write(rest)
+      c.pos = 0
+    }
+    more, err := c.sock.read(65536)
+    if err != nil {
+      c.closed = true
+      return 0, "", err
+    }
+    if more == "" {
+      c.closed = true
+      return 0, "", errors.New("pg: the server closed the connection")
+    }
+    c.buf.write(more)
+  }
+  kind := c.buf.get(c.pos)
+  n := c.buf32(c.pos + 1)
+  body := c.buf.slice(c.pos + 5, c.pos + 1 + n)
+  c.pos += 1 + n
+  if c.pos == c.buf.len() {
+    c.buf.reset()
+    c.pos = 0
+  }
+  return kind, body, nil
+}
+
+fn (c: *Conn) authenticate(cfg: *Config) -> error {
+  client_first := ""
+  server_sig := ""
+  while true {
+    kind, body, err := c.receive()
+    if err != nil { return err }
+    switch kind {
+    case 'R':
+      code := get32(body, 0)
+      switch code {
+      case 0:
+        if server_sig != "" { return errors.New("pg: SCRAM: the server did not prove it knows the password") }
+      case 3:
+        b := &strings.Builder{}
+        cstr(b, cfg.password)
+        serr := c.send(message('p', b.string()))
+        if serr != nil { return serr }
+      case 5:
+        inner := crypto.md5_hex(cfg.password + cfg.user)
+        b := &strings.Builder{}
+        cstr(b, "md5" + crypto.md5_hex(inner + cut(body, 4, 8)))
+        serr := c.send(message('p', b.string()))
+        if serr != nil { return serr }
+      case 10:
+        if !strings.contains(body, "SCRAM-SHA-256") { return errors.New("pg: the server asks for an authentication this client does not know") }
+        raw, rerr := crypto.random_bytes(18)
+        if rerr != nil { return rerr }
+        client_first = "n=,r=" + base64.encode(raw)
+        data := "n,," + client_first
+        b := &strings.Builder{}
+        cstr(b, "SCRAM-SHA-256")
+        int32(b, len(data))
+        b.write(data)
+        serr := c.send(message('p', b.string()))
+        if serr != nil { return serr }
+      case 11:
+        final, sig, ferr := scram_final(cfg.password, client_first, body[4:])
+        if ferr != nil { return ferr }
+        server_sig = sig
+        serr := c.send(message('p', final))
+        if serr != nil { return serr }
+      case 12:
+        if attr(body[4:], "v") != server_sig { return errors.New("pg: SCRAM: the server's signature does not match") }
+        server_sig = ""
+      default:
+        return errors.New("pg: unsupported authentication (code " + str(code) + ")")
+      }
+    case 'S':
+      c.parameter(body)
+    case 'K':
+      c.pid = get32(body, 0)
+    case 'E':
+      return parse_error(body)
+    case 'Z':
+      c.status = int(body[0])
+      return nil
+    }
+  }
+  return nil
+}
+
+fn (c: *Conn) parameter(body: str) {
+  k := strings.index(body, "\x00")
+  if k < 0 { return }
+  v := body[k + 1:]
+  if strings.has_suffix(v, "\x00") { v = v[0:len(v) - 1] }
+  c.params[body[0:k]] = v
+}
+
+# a parameter the server reported: "server_version", "TimeZone", "server_encoding"...
+export fn (c: *Conn) parameter_status(name: str) -> str { return c.params[name] }
+
+export fn (c: *Conn) close() {
+  if c.closed { return }
+  c.sock.write(message('X', ""))
+  c.sock.close()
+  c.closed = true
+}
+
+# ---------------------------------------------------------------------------------------------
+# Results
+
+export struct Rows {
+  columns: []Column
+  data: [][]any       # each row's values
+  index: int          # the current row (after next())
+  tag: str            # the command tag: "SELECT 3", "INSERT 0 1"...
+}
+
+export struct Result {
+  rows_affected: int
+  tag: str
+}
+
+fn tag_count(tag: str) -> int {
+  parts := strings.fields(tag)
+  if len(parts) == 0 { return 0 }
+  n, err := strconv.atoi(parts[len(parts) - 1])
+  if err != nil { return 0 }
+  return n
+}
+
+# moves to the next row; false after the last one
+export fn (r: *Rows) next() -> bool {
+  r.index++
+  return r.index < len(r.data)
+}
+
+export fn (r: *Rows) len() -> int { return len(r.data) }
+
+fn (r: *Rows) col(name: str) -> int {
+  for i, c := range r.columns { if c.name == name { return i } }
+  panic("pg: no column \"" + name + "\"")
+  return -1
+}
+
+fn (r: *Rows) row() -> []any {
+  if r.index < 0 || r.index >= len(r.data) { panic("pg: no current row (call next())") }
+  return r.data[r.index]
+}
+
+# the current row's value of a column (nil for NULL)
+export fn (r: *Rows) get(name: str) -> any { return r.row()[r.col(name)] }
+export fn (r: *Rows) at(i: int) -> any { return r.row()[i] }
+export fn (r: *Rows) values() -> []any { return r.row() }
+export fn (r: *Rows) is_null(name: str) -> bool { return r.get(name) == nil }
+
+# typed getters: the zero value for NULL
+export fn (r: *Rows) get_str(name: str) -> str {
+  switch x := r.get(name).(type) {
+  case nil: return ""
+  case str: return x
+  case int: return str(x)
+  case num: return str(x)
+  case bool:
+    if x { return "true" }
+    return "false"
+  }
+  return ""
+}
+
+export fn (r: *Rows) get_int(name: str) -> int {
+  switch x := r.get(name).(type) {
+  case int: return x
+  case num: return int(x)
+  case str:
+    vi, err := strconv.atoi(x)
+    if err == nil { return vi }
+  }
+  return 0
+}
+
+export fn (r: *Rows) get_num(name: str) -> num {
+  switch x := r.get(name).(type) {
+  case num: return x
+  case int: return num(x)
+  case str:
+    vf, err := strconv.parse_float(x)
+    if err == nil { return vf }
+  }
+  return 0.0
+}
+
+export fn (r: *Rows) get_bool(name: str) -> bool {
+  switch x := r.get(name).(type) {
+  case bool: return x
+  }
+  return false
+}
+
+# every row as a map from column name to value
+export fn (r: *Rows) maps() -> []map[str]any {
+  out := []map[str]any{}
+  for _, row := range r.data {
+    m := map[str]any{}
+    for i, c := range r.columns { m[c.name] = row[i] }
+    out = append(out, m)
+  }
+  return out
+}
+
+# ---------------------------------------------------------------------------------------------
+# Queries
+
+# reads up to ReadyForQuery, collecting the rows of the (last) result and the first error
+fn (c: *Conn) collect() -> (*Rows, error) {
+  rows := &Rows{columns: []Column{}, data: [][]any{}, index: -1}
+  let first_err: error = nil
+  while true {
+    kind, body, err := c.receive()
+    if err != nil { return nil, err }
+    switch kind {
+    case 'T':
+      rows.columns = []Column{}
+      rows.data = [][]any{}
+      n := get16(body, 0)
+      i := 2
+      for k := 0; k < n; k++ {
+        e := strings.index_from(body, "\x00", i)
+        name := body[i:e]
+        i = e + 1
+        oid := get32(body, i + 6)
+        i += 18
+        rows.columns = append(rows.columns, Column{name: name, oid: oid})
+      }
+    case 'D':
+      n := get16(body, 0)
+      i := 2
+      row := make([]any, n)
+      for k := 0; k < n; k++ {
+        l := get32(body, i)
+        i += 4
+        if l < 0 {
+          row[k] = nil
+        } else {
+          row[k] = decode(body[i:i + l], rows.columns[k].oid)
+          i += l
+        }
+      }
+      rows.data = append(rows.data, row)
+    case 'C':
+      rows.tag = body[0:len(body) - 1]
+    case 'E':
+      if first_err == nil { first_err = parse_error(body) }
+    case 'S':
+      c.parameter(body)
+    case 'Z':
+      c.status = int(body[0])
+      if first_err != nil { return nil, first_err }
+      return rows, nil
+    }
+    # '1' ParseComplete, '2' BindComplete, 'n' NoData, 'I' empty query, 'N' notices: nothing
+  }
+  return rows, nil
+}
+
+# the extended protocol: Parse, Bind (the arguments as text), Describe, Execute, Sync
+fn (c: *Conn) extended(sql: str, args: []any) -> (*Rows, error) {
+  out := &strings.Builder{}
+  p := &strings.Builder{}
+  cstr(p, "")
+  cstr(p, sql)
+  int16(p, 0)
+  out.write(message('P', p.string()))
+  bb := &strings.Builder{}
+  cstr(bb, "")
+  cstr(bb, "")
+  int16(bb, 0)              # all parameters in the text format
+  int16(bb, len(args))
+  for _, a := range args {
+    v, ok := encode(a)
+    if !ok {
+      int32(bb, -1)
+    } else {
+      int32(bb, len(v))
+      bb.write(v)
+    }
+  }
+  int16(bb, 0)              # all results in the text format
+  out.write(message('B', bb.string()))
+  out.write(message('D', "P\x00"))
+  e := &strings.Builder{}
+  cstr(e, "")
+  int32(e, 0)
+  out.write(message('E', e.string()))
+  out.write(message('S', ""))
+  err := c.send(out.string())
+  if err != nil { return nil, err }
+  return c.collect()
+}
+
+# runs a query and returns its rows; $1, $2... are the arguments
+export fn (c: *Conn) query(sql: str, args: []any) -> (*Rows, error) { return c.extended(sql, args) }
+
+# the first row of a query (rows.next() already called); an error when there is none
+export fn (c: *Conn) query_row(sql: str, args: []any) -> (*Rows, error) {
+  rows, err := c.extended(sql, args)
+  if err != nil { return nil, err }
+  if !rows.next() { return nil, errors.New("pg: no rows") }
+  return rows, nil
+}
+
+# runs a statement and returns how many rows it changed; without arguments, sql may have several
+# statements separated by ";" (the simple protocol)
+export fn (c: *Conn) exec(sql: str, args: []any) -> (*Result, error) {
+  let rows: *Rows = nil
+  let err: error = nil
+  if len(args) == 0 {
+    b := &strings.Builder{}
+    cstr(b, sql)
+    serr := c.send(message('Q', b.string()))
+    if serr != nil { return nil, serr }
+    rows, err = c.collect()
+  } else {
+    rows, err = c.extended(sql, args)
+  }
+  if err != nil { return nil, err }
+  return &Result{rows_affected: tag_count(rows.tag), tag: rows.tag}, nil
+}
+
+# ---------------------------------------------------------------------------------------------
+# Transactions
+
+export fn (c: *Conn) begin() -> error {
+  _, err := c.exec("BEGIN", []any{})
+  return err
+}
+
+export fn (c: *Conn) commit() -> error {
+  _, err := c.exec("COMMIT", []any{})
+  return err
+}
+
+export fn (c: *Conn) rollback() -> error {
+  _, err := c.exec("ROLLBACK", []any{})
+  return err
+}
+
+# runs f in a transaction: committed when f returns nil, rolled back when it returns an error
+export fn (c: *Conn) transaction(f: fn(*Conn) -> error) -> error {
+  err := c.begin()
+  if err != nil { return err }
+  ferr := f(c)
+  if ferr != nil {
+    c.rollback()
+    return ferr
+  }
+  return c.commit()
+}
+
+export fn (c: *Conn) in_transaction() -> bool { return c.status == 'T' || c.status == 'E' }
+
+# quotes a name for SQL: pg.ident("order") -> "\"order\""
+export fn ident(name: str) -> str { return "\"" + strings.replace_all(name, "\"", "\"\"") + "\"" }
+
+# ---------------------------------------------------------------------------------------------
+# A pool of connections
+
+export struct Pool {
+  cfg: *Config
+  max: int
+  idle: []*Conn
+  open: int
+}
+
+# a pool of up to max connections, opened when needed and kept for the next queries
+export fn open(dsn: str, max: int) -> (*Pool, error) {
+  cfg, err := parse_dsn(dsn)
+  if err != nil { return nil, err }
+  if max < 1 { max = 1 }
+  return &Pool{cfg: cfg, max: max, idle: []*Conn{}}, nil
+}
+
+# a connection for the caller; give it back with release
+export fn (p: *Pool) acquire() -> (*Conn, error) {
+  while len(p.idle) > 0 {
+    c := p.idle[len(p.idle) - 1]
+    p.idle = p.idle[0:len(p.idle) - 1]
+    if !c.closed { return c, nil }
+    p.open--
+  }
+  if p.open >= p.max { return nil, errors.New("pg: the pool has no free connection (max " + str(p.max) + ")") }
+  c, err := connect_config(p.cfg)
+  if err != nil { return nil, err }
+  p.open++
+  return c, nil
+}
+
+# gives a connection back (rolled back if a transaction was left open)
+export fn (p: *Pool) release(c: *Conn) {
+  if c.closed {
+    p.open--
+    return
+  }
+  if c.in_transaction() { c.rollback() }
+  p.idle = append(p.idle, c)
+}
+
+export fn (p: *Pool) query(sql: str, args: []any) -> (*Rows, error) {
+  c, err := p.acquire()
+  if err != nil { return nil, err }
+  rows, qerr := c.query(sql, args)
+  p.release(c)
+  return rows, qerr
+}
+
+export fn (p: *Pool) query_row(sql: str, args: []any) -> (*Rows, error) {
+  c, err := p.acquire()
+  if err != nil { return nil, err }
+  rows, qerr := c.query_row(sql, args)
+  p.release(c)
+  return rows, qerr
+}
+
+export fn (p: *Pool) exec(sql: str, args: []any) -> (*Result, error) {
+  c, err := p.acquire()
+  if err != nil { return nil, err }
+  res, qerr := c.exec(sql, args)
+  p.release(c)
+  return res, qerr
+}
+
+export fn (p: *Pool) transaction(f: fn(*Conn) -> error) -> error {
+  c, err := p.acquire()
+  if err != nil { return err }
+  terr := c.transaction(f)
+  p.release(c)
+  return terr
+}
+
+export fn (p: *Pool) close() {
+  for _, c := range p.idle { c.close() }
+  p.idle = []*Conn{}
+  p.open = 0
+}
+
+export fn (p: *Pool) stats() -> (int, int) { return p.open, len(p.idle) }

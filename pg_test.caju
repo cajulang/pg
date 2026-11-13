@@ -1,0 +1,79 @@
+# Unit tests (no server); the tests against a real PostgreSQL are in integration_test.caju.
+import { describe, it, expect } from "std/testing"
+import "std/strings"
+import "pg"
+
+describe("pg.parse_dsn", fn() {
+  it("reads a URL", fn() {
+    c, err := pg.parse_dsn("postgres://app:s%40cret@db.local:6543/shop?application_name=api")
+    expect(err == nil).to_equal(true)
+    expect(c.user).to_equal("app")
+    expect(c.password).to_equal("s@cret")
+    expect(c.host).to_equal("db.local")
+    expect(c.port).to_equal(6543)
+    expect(c.database).to_equal("shop")
+    expect(c.application_name).to_equal("api")
+  })
+  it("reads key=value settings, with defaults", fn() {
+    c, err := pg.parse_dsn("user=ana dbname=lab")
+    expect(err == nil).to_equal(true)
+    expect(c.host).to_equal("127.0.0.1")
+    expect(c.port).to_equal(5432)
+    expect(c.user).to_equal("ana")
+    expect(c.database).to_equal("lab")
+  })
+  it("uses the user as the database when there is none", fn() {
+    c, _ := pg.parse_dsn("postgres://ana@127.0.0.1")
+    expect(c.database).to_equal("ana")
+  })
+  it("refuses TLS modes it cannot do", fn() {
+    _, err := pg.parse_dsn("postgres://a@h/db?sslmode=require")
+    expect(err != nil).to_equal(true)
+  })
+})
+
+describe("pg values", fn() {
+  it("encodes parameters in the text format", fn() {
+    v, ok := pg.encode(nil)
+    expect(ok).to_equal(false)
+    v, ok = pg.encode(true)
+    expect(v).to_equal("t")
+    v, ok = pg.encode(42)
+    expect(v).to_equal("42")
+    v, ok = pg.encode(pg.bytes("\x01\x7f"))
+    expect(v).to_equal("\\x017f")
+  })
+  it("decodes columns by their type", fn() {
+    expect(pg.decode("t", 16)).to_equal(true)
+    expect(pg.decode("-7", 23)).to_equal(-7)
+    expect(pg.decode("9007199254740993", 20)).to_equal(9007199254740993)
+    expect(pg.decode("2.5", 701)).to_equal(2.5)
+    expect(pg.decode("\\x6361", 17)).to_equal("ca")
+    expect(pg.decode("12.30", 1700)).to_equal("12.30")
+    expect(pg.decode("{\"a\":1}", 3802)).to_equal("{\"a\":1}")
+  })
+  it("builds messages with their length", fn() {
+    m := pg.message('Q', "select 1\x00")
+    expect(len(m)).to_equal(14)
+    expect(int(m[0])).to_equal('Q')
+    expect(int(m[4])).to_equal(13)
+  })
+  it("quotes identifiers", fn() {
+    expect(pg.ident("order")).to_equal("\"order\"")
+    expect(pg.ident("a\"b")).to_equal("\"a\"\"b\"")
+  })
+})
+
+describe("SCRAM-SHA-256", fn() {
+  # RFC 7677, section 3
+  it("computes the client proof and the server signature of the RFC's example", fn() {
+    final, sig, err := pg.scram_final("pencil", "n=user,r=rOprNGfwEbeRWgbNEkqO", "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    expect(err == nil).to_equal(true)
+    expect(final).to_equal("c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+    expect(sig).to_equal("6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+  })
+  it("refuses a server nonce that does not extend the client's", fn() {
+    _, _, err := pg.scram_final("pencil", "n=user,r=abc", "r=xyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    expect(err != nil).to_equal(true)
+  })
+})
