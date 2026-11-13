@@ -1,5 +1,5 @@
 [package]
-name = "github.com/aecdanjundex/pg"
+name = "github.com/cajulang/pg"
 version = "0.1.0"
 description = "A PostgreSQL client for Caju: the wire protocol over TCP, SCRAM-SHA-256, parameters, transactions and a pool"
 license = "MIT"

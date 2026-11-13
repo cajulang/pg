@@ -1,10 +1,10 @@
 # pg
 
-A PostgreSQL client for [Caju](https://github.com/aecdanjundex/cajulang), written in Caju: it
+A PostgreSQL client for [Caju](https://github.com/cajulang/cajulang), written in Caju: it
 speaks PostgreSQL's frontend/backend protocol (version 3) directly over TCP, with no C library.
 
 ```caju
-import "github.com/aecdanjundex/pg"
+import "github.com/cajulang/pg"
 
 db, err := pg.connect("postgres://app:secret@127.0.0.1:5432/shop")
 if err != nil { panic(err.Error()) }
