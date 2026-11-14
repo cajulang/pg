@@ -21,7 +21,9 @@ print(res.rows_affected)
 ## What it does
 
 - **Connecting:** a URL (`postgres://user:password@host:port/db?application_name=x`) or
-  `key=value` settings (`host=… port=… user=… password=… dbname=…`).
+  `key=value` settings (`host=… port=… user=… password=… dbname=…`). The host is an IPv4 address
+  or a name (`/etc/hosts`, then DNS: `db.internal`, a Kubernetes service). `connect_timeout=5`
+  gives up after 5 seconds.
 - **Authentication:** trust, password, md5 and SCRAM-SHA-256, PostgreSQL's default since
   version 14. With SCRAM it also checks the server's signature.
 - **Queries with arguments** (`$1`, `$2`…) go through the extended protocol. The values travel
@@ -93,6 +95,10 @@ Against node-postgres 8.23, on PostgreSQL 17 over the local network (median of 3
 - Connecting costs more: SCRAM's 4,096 rounds of PBKDF2 run in Caju, where Node uses OpenSSL.
   With a pool, the connection is made once.
 - Reading a large result is slower: each value is copied and decoded on its own.
+
+## Requirements
+
+Caju 0.6.0 or newer (host names, timeouts, and byte-exact string slices).
 
 ## Tests
 

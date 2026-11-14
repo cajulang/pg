@@ -29,10 +29,11 @@ export struct Config {
   password: str
   database: str
   application_name: str
+  connect_timeout: int    # seconds to wait for the server to accept the connection (0: the system's limit)
 }
 
-# postgres://user:password@host:port/database?application_name=x (also postgresql://), or the
-# key=value form: "host=127.0.0.1 port=5432 user=app password=secret dbname=shop"
+# postgres://user:password@host:port/database?application_name=x&connect_timeout=5 (also
+# postgresql://), or the key=value form: "host=db.internal port=5432 user=app dbname=shop"
 export fn parse_dsn(dsn: str) -> (*Config, error) {
   c := &Config{host: "127.0.0.1", port: 5432, user: "postgres", application_name: "caju-pg"}
   if strings.has_prefix(dsn, "postgres://") || strings.has_prefix(dsn, "postgresql://") {
@@ -99,6 +100,10 @@ fn (c: *Config) set(key: str, value: str) -> error {
   case "password": c.password = value
   case "dbname": c.database = value
   case "application_name": c.application_name = value
+  case "connect_timeout":
+    t, err := strconv.atoi(value)
+    if err != nil || t < 0 { return errors.New("pg: bad connect_timeout \"" + value + "\"") }
+    c.connect_timeout = t
   case "sslmode":
     if value != "disable" && value != "allow" && value != "prefer" { return errors.New("pg: TLS is not supported (sslmode=" + value + ")") }
   }
@@ -318,10 +323,9 @@ export fn connect(dsn: str) -> (*Conn, error) {
 }
 
 export fn connect_config(cfg: *Config) -> (*Conn, error) {
-  host := cfg.host
-  if host == "localhost" { host = "127.0.0.1" }
-  sock, err := net.dial(host, cfg.port)
-  if err != nil { return nil, err }
+  # the host is an IPv4 address or a name (net.resolve: /etc/hosts, then DNS)
+  sock, err := net.dial_timeout(cfg.host, cfg.port, cfg.connect_timeout * 1000)
+  if err != nil { return nil, errors.New("pg: " + err.Error()) }
   sock.set_nodelay()
   c := &Conn{sock: sock, params: map[str]str{}, status: 'I', buf: rawbytes.new_buffer(65536)}
   # the startup message: protocol 3.0, then name/value pairs
@@ -354,14 +358,6 @@ fn (c: *Conn) send(data: str) -> error {
     return err
   }
   return nil
-}
-
-# a byte-exact piece of a string (Caju's s[a:b] replaces bytes that are not UTF-8, and the
-# protocol is binary: lengths, OIDs, salts)
-fn cut(s: str, lo: int, hi: int) -> str {
-  b := &strings.Builder{}
-  for i := lo; i < hi; i++ { b.write_byte(int(s[i])) }
-  return b.string()
 }
 
 fn (c: *Conn) buf32(at: int) -> int {
@@ -422,7 +418,7 @@ fn (c: *Conn) authenticate(cfg: *Config) -> error {
       case 5:
         inner := crypto.md5_hex(cfg.password + cfg.user)
         b := &strings.Builder{}
-        cstr(b, "md5" + crypto.md5_hex(inner + cut(body, 4, 8)))
+        cstr(b, "md5" + crypto.md5_hex(inner + body[4:8]))
         serr := c.send(message('p', b.string()))
         if serr != nil { return serr }
       case 10:

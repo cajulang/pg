@@ -26,9 +26,28 @@ describe("pg.parse_dsn", fn() {
     c, _ := pg.parse_dsn("postgres://ana@127.0.0.1")
     expect(c.database).to_equal("ana")
   })
+  it("reads connect_timeout, in seconds", fn() {
+    c, _ := pg.parse_dsn("postgres://a@db.internal/x?connect_timeout=5")
+    expect(c.connect_timeout).to_equal(5)
+    d, _ := pg.parse_dsn("host=db.internal connect_timeout=2")
+    expect(d.connect_timeout).to_equal(2)
+    _, err := pg.parse_dsn("connect_timeout=soon")
+    expect(err).to_be_error("pg: bad connect_timeout \"soon\"")
+  })
   it("refuses TLS modes it cannot do", fn() {
     _, err := pg.parse_dsn("postgres://a@h/db?sslmode=require")
     expect(err != nil).to_equal(true)
+  })
+})
+
+describe("pg.connect", fn() {
+  it("reports a host name that does not resolve", fn() {
+    _, err := pg.connect("postgres://a@no-such-host.invalid/x")
+    expect(err.Error()).to_start_with("pg: dial no-such-host.invalid:5432: ")
+  })
+  it("gives up after connect_timeout", fn() {
+    _, err := pg.connect("postgres://a@10.255.255.1/x?connect_timeout=1")
+    expect(err).to_be_error("pg: dial 10.255.255.1:5432: timed out")
   })
 })
 
