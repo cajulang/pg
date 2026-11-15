@@ -1,0 +1,361 @@
+# A fake PostgreSQL server for security_test.caju: it speaks just enough of the protocol to play
+# a well-behaved or a malicious server. One connection at a time, on 127.0.0.1:$PORT.
+#
+# The startup message's user picks how it authenticates (trust, cleartext, md5, scram, and the
+# broken or hostile variants below); the SQL picks how it answers a query. What it receives is
+# appended to $LOGDIR/<database> (and $LOGDIR/cancel for CancelRequests), so a test can check
+# what the client sent. $SSL is the answer to an SSLRequest: N (the default) or "inject" (S plus
+# bytes that should never be read as part of the TLS handshake).
+import "std/net"
+import "std/os"
+import "std/strings"
+import "std/strconv"
+import "std/crypto"
+import "std/base64"
+
+let LOGDIR = os.getenv("LOGDIR")
+let PASSWORD = "secret"
+let next_pid: int = 4241
+
+struct Peer {
+  sock: *net.Conn
+  buf: str
+  tag: str
+  pid: int
+  status: str
+}
+
+fn log(tag: str, line: str) {
+  if tag == "" { tag = "untagged" }
+  path := LOGDIR + "/" + tag
+  old, _ := os.read_file(path)
+  os.write_file(path, old + line + "\n", 0o644)
+}
+
+fn be32(v: int) -> str {
+  b := &strings.Builder{}
+  b.write_byte((v >> 24) & 255)
+  b.write_byte((v >> 16) & 255)
+  b.write_byte((v >> 8) & 255)
+  b.write_byte(v & 255)
+  return b.string()
+}
+
+fn be16(v: int) -> str {
+  b := &strings.Builder{}
+  b.write_byte((v >> 8) & 255)
+  b.write_byte(v & 255)
+  return b.string()
+}
+
+fn get32(s: str, i: int) -> int { return (int(s[i]) << 24) | (int(s[i + 1]) << 16) | (int(s[i + 2]) << 8) | int(s[i + 3]) }
+
+fn msg(kind: int, body: str) -> str { return strings.from_byte(kind) + be32(len(body) + 4) + body }
+
+fn cs(s: str) -> str { return s + "\x00" }
+
+fn (p: *Peer) send(data: str) { p.sock.write(data) }
+
+# n bytes from the client; ok false when it closed
+fn (p: *Peer) read_n(n: int) -> (str, bool) {
+  while len(p.buf) < n {
+    more, err := p.sock.read(65536)
+    if err != nil || more == "" { return "", false }
+    p.buf = p.buf + more
+  }
+  out := p.buf[0:n]
+  p.buf = p.buf[n:]
+  return out, true
+}
+
+# a typed message: (kind, body), kind 0 when the client closed
+fn (p: *Peer) next() -> (int, str) {
+  head, ok := p.read_n(5)
+  if !ok { return 0, "" }
+  body, ok2 := p.read_n(get32(head, 1) - 4)
+  if !ok2 { return 0, "" }
+  return int(head[0]), body
+}
+
+# waits until the client closes
+fn (p: *Peer) drain() {
+  while true {
+    more, err := p.sock.read(65536)
+    if err != nil || more == "" { return }
+  }
+}
+
+fn error_body(code: str, text: str) -> str { return "SERROR\x00C" + code + "\x00M" + text + "\x00\x00" }
+
+fn (p: *Peer) ok_tail() {
+  p.send(msg('R', be32(0)) + msg('S', cs("server_version") + cs("17.0-fake")) + msg('K', be32(p.pid) + be32(777)) + msg('Z', "I"))
+}
+
+fn attr(m: str, key: str) -> str {
+  for _, part := range strings.split(m, ",") {
+    if strings.has_prefix(part, key + "=") { return part[len(key) + 1:] }
+  }
+  return ""
+}
+
+fn xor(a: str, b: str) -> str {
+  out := &strings.Builder{}
+  for i := 0; i < len(a); i++ { out.write_byte(int(a[i]) ^ int(b[i])) }
+  return out.string()
+}
+
+# authenticates as the scenario says; false when the connection is over
+fn (p: *Peer) authenticate(user: str) -> bool {
+  switch user {
+  case "trust", "dirty_reset", "stuck_reset":
+    p.ok_tail()
+    return true
+  case "cleartext":
+    p.send(msg('R', be32(3)))
+    k, body := p.next()
+    if k == 'p' { log(p.tag, "password " + body[0:len(body) - 1]) }
+    if k == 0 { return false }
+    p.ok_tail()
+    return true
+  case "md5":
+    p.send(msg('R', be32(5) + "salt"))
+    k, body := p.next()
+    if k == 'p' { log(p.tag, "md5 " + body[0:len(body) - 1]) }
+    if k == 0 { return false }
+    p.ok_tail()
+    return true
+  case "ready_noauth":
+    p.send(msg('Z', "I"))
+    p.drain()
+    return false
+  case "key_before_ok":
+    p.send(msg('K', be32(1) + be32(2)) + msg('R', be32(0)) + msg('Z', "I"))
+    p.drain()
+    return false
+  case "short_auth":
+    p.send("R" + be32(4))
+    p.drain()
+    return false
+  case "huge_auth":
+    p.send("R" + be32(0x7fffffff) + "\x00\x00\x00\x00")
+    p.drain()
+    return false
+  case "negative_auth":
+    p.send("R" + be32(-1))
+    p.drain()
+    return false
+  case "silent":
+    p.drain()
+    return false
+  case "scram_plus_only":
+    p.send(msg('R', be32(10) + cs("SCRAM-SHA-256-PLUS") + "\x00"))
+    p.drain()
+    return false
+  }
+  if !strings.has_prefix(user, "scram") { return false }
+  # SCRAM-SHA-256, server side
+  p.send(msg('R', be32(10) + cs("SCRAM-SHA-256") + "\x00"))
+  k, body := p.next()
+  if k != 'p' { return false }
+  e := strings.index(body, "\x00")
+  first := body[e + 5:]
+  log(p.tag, "scram-first " + first)
+  bare := first[3:]                  # without "n,,"
+  if user == "scram_ok_early" {
+    p.ok_tail()
+    p.drain()
+    return false
+  }
+  nonce := attr(bare, "r") + "srvnonce"
+  salt := "pepper-and-salt!"
+  iterations := 4096
+  if user == "scram_iter" { iterations = 100000000 }
+  server_first := "r=" + nonce + ",s=" + base64.encode(salt) + ",i=" + str(iterations)
+  p.send(msg('R', be32(11) + server_first))
+  k2, final := p.next()
+  if k2 != 'p' { return false }
+  log(p.tag, "scram-final")
+  if user == "scram_skip_final" {
+    p.ok_tail()
+    p.drain()
+    return false
+  }
+  without_proof := final[0:strings.index(final, ",p=")]
+  salted := crypto.pbkdf2_sha256(PASSWORD, salt, iterations, 32)
+  client_key := crypto.hmac_sha256(salted, "Client Key")
+  auth := bare + "," + server_first + "," + without_proof
+  want := xor(client_key, crypto.hmac_sha256(crypto.sha256(client_key), auth))
+  proof, _ := base64.decode(attr(final, "p"))
+  if proof != want {
+    p.send(msg('E', error_body("28P01", "password authentication failed")))
+    return false
+  }
+  sig := base64.encode(crypto.hmac_sha256(crypto.hmac_sha256(salted, "Server Key"), auth))
+  if user == "scram_badsig" { sig = base64.encode("not the right signature, sorry!!") }
+  p.send(msg('R', be32(12) + "v=" + sig))
+  p.ok_tail()
+  return true
+}
+
+# one column "n" of type int4 and its rows
+fn row_desc() -> str { return msg('T', be16(1) + cs("n") + be32(0) + be16(0) + be32(23) + be16(4) + be32(-1) + be16(0)) }
+
+# the answer to a statement; false when the connection should end. extended: it came as
+# Parse/Bind/Describe/Execute/Sync
+fn (p: *Peer) answer(user: str, sql: str, extended: bool) -> bool {
+  pre := ""
+  if extended { pre = msg('1', "") + msg('2', "") }
+  z := msg('Z', p.status)
+  switch sql {
+  case "select 1":
+    p.send(pre + row_desc() + msg('D', be16(1) + be32(1) + "1") + msg('C', cs("SELECT 1")) + z)
+  case "copy in":
+    p.send(pre + msg('G', "\x00\x00\x00"))
+    # the client must give up with CopyFail (and, extended, a new Sync)
+    while true {
+      k, body := p.next()
+      if k == 0 { return false }
+      if k == 'f' { log(p.tag, "CopyFail " + body[0:len(body) - 1]) }
+      if k == 'f' && !extended { break }
+      if k == 'S' { break }
+    }
+    p.send(msg('E', error_body("57014", "COPY from stdin failed")) + z)
+  case "copy out":
+    p.send(pre + msg('H', "\x00\x00\x00") + msg('d', "a\n") + msg('d', "b\n") + msg('c', "") + msg('C', cs("COPY 2")) + z)
+  case "copy both":
+    p.send(pre + msg('W', "\x00\x00\x00"))
+    p.drain()
+    return false
+  case "hang":
+    p.drain()
+    return false
+  case "huge":
+    p.send(pre + "D" + be32(0x7ffffff0) + "\x00\x01")
+    p.drain()
+    return false
+  case "short":
+    p.send(pre + "C" + be32(2))
+    p.drain()
+    return false
+  case "negative":
+    p.send(pre + "C" + be32(-16))
+    p.drain()
+    return false
+  case "wide row":
+    p.send(pre + row_desc() + msg('D', be16(3) + be32(1) + "1" + be32(1) + "2" + be32(1) + "3") + msg('C', cs("SELECT 1")) + z)
+    p.drain()
+    return false
+  case "row overrun":
+    p.send(pre + row_desc() + msg('D', be16(1) + be32(1000) + "123") + msg('C', cs("SELECT 1")) + z)
+    p.drain()
+    return false
+  case "negative column":
+    p.send(pre + row_desc() + msg('D', be16(1) + be32(-5) + "123") + msg('C', cs("SELECT 1")) + z)
+    p.drain()
+    return false
+  case "row first":
+    p.send(pre + msg('D', be16(1) + be32(1) + "1") + msg('C', cs("SELECT 1")) + z)
+    p.drain()
+    return false
+  case "short ready":
+    p.send(pre + msg('C', cs("SELECT 0")) + msg('Z', ""))
+    p.drain()
+    return false
+  case "short key":
+    p.send(pre + msg('C', cs("SELECT 0")) + msg('K', "\x01") + z)
+    p.drain()
+    return false
+  case "BEGIN":
+    p.status = "T"
+    p.send(pre + msg('n', "") + msg('C', cs("BEGIN")) + msg('Z', "T"))
+  case "COMMIT", "ROLLBACK":
+    p.status = "I"
+    p.send(pre + msg('n', "") + msg('C', cs(sql)) + msg('Z', "I"))
+  case "DISCARD ALL":
+    if user == "dirty_reset" {
+      p.send(msg('E', error_body("0A000", "DISCARD ALL is not supported here")) + z)
+    } else if user == "stuck_reset" {
+      p.status = "T"
+      p.send(msg('C', cs("DISCARD ALL")) + msg('Z', "T"))
+    } else {
+      p.send(msg('C', cs("DISCARD ALL")) + z)
+    }
+  default:
+    p.send(pre + msg('n', "") + msg('C', cs("OK")) + z)
+  }
+  return true
+}
+
+fn (p: *Peer) serve() {
+  head, ok := p.read_n(8)
+  if !ok { return }
+  n := get32(head, 0)
+  code := get32(head, 4)
+  if code == 80877103 {
+    mode := os.getenv("SSL")
+    log("ssl", "SSLRequest")
+    if mode == "inject" {
+      p.send("S" + msg('Z', "I"))
+      p.drain()
+      return
+    }
+    p.send("N")
+    head, ok = p.read_n(8)
+    if !ok { return }
+    n = get32(head, 0)
+    code = get32(head, 4)
+  }
+  rest, ok2 := p.read_n(n - 8)
+  if !ok2 { return }
+  if code == 80877102 {
+    log("cancel", "cancel " + str(get32(rest, 0)) + " " + str(get32(rest, 4)))
+    return
+  }
+  params := map[str]str{}
+  parts := strings.split(rest, "\x00")
+  for i := 0; i + 1 < len(parts); i += 2 {
+    if parts[i] == "" { break }
+    params[parts[i]] = parts[i + 1]
+  }
+  user := params["user"]
+  p.tag = params["database"]
+  next_pid++
+  p.pid = next_pid
+  log(p.tag, "startup user=" + user + " database=" + params["database"] + " application_name=" + params["application_name"] + " keys=" + str(len(params)))
+  if !p.authenticate(user) { return }
+  while true {
+    k, body := p.next()
+    switch k {
+    case 0, 'X':
+      return
+    case 'Q':
+      sql := body[0:len(body) - 1]
+      log(p.tag, "Q " + sql)
+      if !p.answer(user, sql, false) { return }
+    case 'P':
+      sql := body[1:len(body) - 3]
+      log(p.tag, "P " + sql)
+      # Bind, Describe, Execute, Sync
+      while true {
+        k2, _ := p.next()
+        if k2 == 0 { return }
+        if k2 == 'S' { break }
+      }
+      if !p.answer(user, sql, true) { return }
+    default:
+      log(p.tag, "message " + strings.from_byte(k))
+    }
+  }
+}
+
+port, _ := strconv.atoi(os.getenv("PORT"))
+listener, lerr := net.listen("127.0.0.1", port)
+if lerr != nil { panic(lerr.Error()) }
+while true {
+  c, aerr := listener.accept()
+  if aerr != nil { continue }
+  c.set_timeout(20000)
+  peer := &Peer{sock: c, status: "I"}
+  peer.serve()
+  c.close()
+}

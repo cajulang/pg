@@ -1,4 +1,5 @@
-# pg: a PostgreSQL client for Caju, speaking the frontend/backend protocol (version 3) over TCP.
+# pg: a PostgreSQL client for Caju, speaking the frontend/backend protocol (version 3) over TCP,
+# optionally inside TLS.
 #
 #   db, err := pg.connect("postgres://app:secret@127.0.0.1:5432/shop")
 #   rows, err := db.query("select id, name from products where price < $1", []any{10.5})
@@ -6,12 +7,17 @@
 #   res, err := db.exec("update products set price = $1 where id = $2", []any{9.9, 7})
 #   print(res.rows_affected)
 #
-# Authentication: trust, password, md5 and SCRAM-SHA-256 (PostgreSQL's default). Queries with
-# arguments use the extended protocol (each $n is sent apart from the SQL: no injection); exec
-# without arguments uses the simple protocol, which runs several statements. Values come back as
-# Caju values: int, num, bool, str (text, bytea's bytes, json, dates...), or nil for NULL.
-# No TLS: use it on a private network or through a tunnel (sslmode=disable).
+# Authentication: SCRAM-SHA-256 (PostgreSQL's default) and, when require_auth allows them, md5,
+# a password in clear text or none at all. query and exec always use the extended protocol (each
+# $n is sent apart from the SQL: no injection, one statement); exec_script uses the simple
+# protocol, which runs several statements. Values come back as Caju values: int, num, bool, str
+# (text, bytea's bytes, json, dates...), or nil for NULL.
+# TLS: sslmode=require (encrypted, the certificate is not checked), verify-full (the certificate
+# chain and the host name are checked), prefer and allow (TLS when the server offers it).
 import "std/net"
+import "std/tls"
+import "std/x509"
+import "std/os"
 import "std/strings"
 import "std/strconv"
 import "std/crypto"
@@ -30,12 +36,24 @@ export struct Config {
   database: str
   application_name: str
   connect_timeout: int    # seconds to wait for the server to accept the connection (0: the system's limit)
+  sslmode: str            # disable (the default), allow, prefer, require or verify-full
+  sslrootcert: str        # PEM file with the roots trusted for verify-full ("" or "system": the system's)
+  require_auth: str       # methods the server may ask for: "scram-sha-256,md5,password,none" (see auth_methods)
+  query_timeout: int      # seconds a query may take (0: no limit); then it is canceled and the connection closed
+  max_message: int        # the largest message accepted from the server, in bytes (0: 64 MiB)
 }
 
+const DEFAULT_MAX_MESSAGE = 67108864
+# seconds for TLS and authentication when connect_timeout is 0
+const HANDSHAKE_SECONDS = 30
+# SCRAM's PBKDF2 rounds a server may ask for (PostgreSQL uses 4096): more is a way to burn our CPU
+export const MAX_SCRAM_ITERATIONS = 600000
+
 # postgres://user:password@host:port/database?application_name=x&connect_timeout=5 (also
-# postgresql://), or the key=value form: "host=db.internal port=5432 user=app dbname=shop"
+# postgresql://), or the key=value form: "host=db.internal port=5432 user=app dbname=shop".
+# Errors never repeat the DSN (it may hold the password).
 export fn parse_dsn(dsn: str) -> (*Config, error) {
-  c := &Config{host: "127.0.0.1", port: 5432, user: "postgres", application_name: "caju-pg"}
+  c := &Config{host: "127.0.0.1", port: 5432, user: "postgres", application_name: "caju-pg", sslmode: "disable"}
   if strings.has_prefix(dsn, "postgres://") || strings.has_prefix(dsn, "postgresql://") {
     rest := dsn[strings.index(dsn, "://") + 3:]
     query := ""
@@ -46,7 +64,8 @@ export fn parse_dsn(dsn: str) -> (*Config, error) {
     }
     slash := strings.index(rest, "/")
     if slash >= 0 {
-      c.database = unescape(rest[slash + 1:])
+      err := c.set("dbname", unescape(rest[slash + 1:]))
+      if err != nil { return nil, err }
       rest = rest[0:slash]
     }
     at := strings.last_index(rest, "@")
@@ -55,32 +74,39 @@ export fn parse_dsn(dsn: str) -> (*Config, error) {
       rest = rest[at + 1:]
       colon := strings.index(cred, ":")
       if colon >= 0 {
-        c.user = unescape(cred[0:colon])
-        c.password = unescape(cred[colon + 1:])
+        err := c.set("user", unescape(cred[0:colon]))
+        if err != nil { return nil, err }
+        err = c.set("password", unescape(cred[colon + 1:]))
+        if err != nil { return nil, err }
       } else {
-        c.user = unescape(cred)
+        err := c.set("user", unescape(cred))
+        if err != nil { return nil, err }
       }
     }
     colon := strings.last_index(rest, ":")
     if colon >= 0 {
       p, err := strconv.atoi(rest[colon + 1:])
-      if err != nil { return nil, errors.New("pg: bad port in \"" + dsn + "\"") }
+      if err != nil || p < 1 || p > 65535 { return nil, errors.New("pg: bad port in the URL") }
       c.port = p
       rest = rest[0:colon]
     }
-    if rest != "" { c.host = rest }
+    if rest != "" {
+      err := c.set("host", unescape(rest))
+      if err != nil { return nil, err }
+    }
     if query != "" {
       for _, kv := range strings.split(query, "&") {
+        if kv == "" { continue }
         e := strings.index(kv, "=")
-        if e < 0 { continue }
-        err := c.set(kv[0:e], unescape(kv[e + 1:]))
+        if e < 0 { return nil, errors.New("pg: bad setting in the URL (expected key=value)") }
+        err := c.set(unescape(kv[0:e]), unescape(kv[e + 1:]))
         if err != nil { return nil, err }
       }
     }
   } else {
     for _, kv := range strings.fields(dsn) {
       e := strings.index(kv, "=")
-      if e < 0 { return nil, errors.New("pg: bad setting \"" + kv + "\"") }
+      if e < 0 { return nil, errors.New("pg: bad setting (expected key=value)") }
       err := c.set(kv[0:e], kv[e + 1:])
       if err != nil { return nil, err }
     }
@@ -89,12 +115,14 @@ export fn parse_dsn(dsn: str) -> (*Config, error) {
   return c, nil
 }
 
+# a setting from a DSN; error messages name the key, never a secret value
 fn (c: *Config) set(key: str, value: str) -> error {
+  if strings.contains(value, "\x00") { return errors.New("pg: a NUL byte in the setting " + safe_key(key)) }
   switch key {
   case "host": c.host = value
   case "port":
     p, err := strconv.atoi(value)
-    if err != nil { return errors.New("pg: bad port \"" + value + "\"") }
+    if err != nil || p < 1 || p > 65535 { return errors.New("pg: bad port \"" + value + "\"") }
     c.port = p
   case "user": c.user = value
   case "password": c.password = value
@@ -104,10 +132,54 @@ fn (c: *Config) set(key: str, value: str) -> error {
     t, err := strconv.atoi(value)
     if err != nil || t < 0 { return errors.New("pg: bad connect_timeout \"" + value + "\"") }
     c.connect_timeout = t
+  case "query_timeout":
+    t, err := strconv.atoi(value)
+    if err != nil || t < 0 { return errors.New("pg: bad query_timeout \"" + value + "\"") }
+    c.query_timeout = t
+  case "max_message":
+    t, err := strconv.atoi(value)
+    if err != nil || t < 0 { return errors.New("pg: bad max_message \"" + value + "\"") }
+    c.max_message = t
   case "sslmode":
-    if value != "disable" && value != "allow" && value != "prefer" { return errors.New("pg: TLS is not supported (sslmode=" + value + ")") }
+    serr := check_sslmode(value)
+    if serr != nil { return serr }
+    c.sslmode = value
+  case "sslrootcert": c.sslrootcert = value
+  case "require_auth":
+    _, aerr := auth_methods(value, false)
+    if aerr != nil { return aerr }
+    c.require_auth = value
+  default:
+    return errors.New("pg: unknown setting " + safe_key(key))
   }
   return nil
+}
+
+# libpq's settings: their names can be shown in an error. Any other key is left out, since a
+# mistyped DSN can put part of a password where a key was expected ("password=correct horse=x").
+let LIBPQ_KEYS = []str{"host", "hostaddr", "port", "dbname", "user", "password", "passfile",
+  "require_auth", "channel_binding", "connect_timeout", "client_encoding", "options",
+  "application_name", "fallback_application_name", "keepalives", "keepalives_idle",
+  "keepalives_interval", "keepalives_count", "tcp_user_timeout", "replication", "gssencmode",
+  "sslmode", "sslnegotiation", "sslcompression", "sslcert", "sslkey", "sslpassword",
+  "sslcertmode", "sslrootcert", "sslcrl", "sslcrldir", "sslsni", "requirepeer",
+  "ssl_min_protocol_version", "ssl_max_protocol_version", "krbsrvname", "gsslib",
+  "gssdelegation", "service", "target_session_attrs", "load_balance_hosts", "query_timeout",
+  "max_message"}
+
+fn safe_key(key: str) -> str {
+  for _, k := range LIBPQ_KEYS {
+    if k == key { return "\"" + key + "\"" }
+  }
+  return "(not shown: only the names of settings libpq knows are)"
+}
+
+fn check_sslmode(mode: str) -> error {
+  switch mode {
+  case "", "disable", "allow", "prefer", "require", "verify-full": return nil
+  case "verify-ca": return errors.New("pg: sslmode=verify-ca is not supported (std/tls checks the chain together with the host name): use verify-full")
+  }
+  return errors.New("pg: bad sslmode \"" + mode + "\" (disable, allow, prefer, require or verify-full)")
 }
 
 # %XX escapes of a URL
@@ -116,9 +188,9 @@ fn unescape(s: str) -> str {
   b := &strings.Builder{}
   i := 0
   while i < len(s) {
-    if int(s[i]) == '%' && i + 2 < len(s) {
+    if int(s[i]) == '%' && i + 3 <= len(s) {
       v, err := strconv.parse_int(s[i + 1:i + 3], 16)
-      if err == nil {
+      if err == nil && v >= 0 && v <= 255 {
         b.write_byte(v)
         i += 3
         continue
@@ -128,6 +200,50 @@ fn unescape(s: str) -> str {
     i++
   }
   return b.string()
+}
+
+# the authentication methods require_auth allows, as a set of AUTH_* bits. "" means
+# scram-sha-256 alone, unless the server's certificate was verified (sslmode=verify-full): then
+# any. Otherwise a comma-separated list of scram-sha-256, md5, password (in clear text) and none
+# (the server asks for nothing: trust).
+export const AUTH_NONE = 1
+export const AUTH_PASSWORD = 2
+export const AUTH_MD5 = 4
+export const AUTH_SCRAM = 8
+
+export fn auth_methods(spec: str, verified: bool) -> (int, error) {
+  if spec == "" {
+    if verified { return AUTH_NONE | AUTH_PASSWORD | AUTH_MD5 | AUTH_SCRAM, nil }
+    return AUTH_SCRAM, nil
+  }
+  m := 0
+  for _, part := range strings.split(spec, ",") {
+    switch strings.trim_space(part) {
+    case "none": m = m | AUTH_NONE
+    case "password": m = m | AUTH_PASSWORD
+    case "md5": m = m | AUTH_MD5
+    case "scram-sha-256": m = m | AUTH_SCRAM
+    default:
+      return 0, errors.New("pg: bad require_auth \"" + spec + "\" (a list of scram-sha-256, md5, password and none)")
+    }
+  }
+  return m, nil
+}
+
+# the checks of connect_config, for a Config built by hand too
+fn (cfg: *Config) validate() -> error {
+  names := []str{"host", "user", "password", "dbname", "application_name"}
+  values := []str{cfg.host, cfg.user, cfg.password, cfg.database, cfg.application_name}
+  for i, v := range values {
+    if strings.contains(v, "\x00") { return errors.New("pg: a NUL byte in the setting \"" + names[i] + "\"") }
+  }
+  if cfg.port < 1 || cfg.port > 65535 { return errors.New("pg: bad port " + str(cfg.port)) }
+  if cfg.connect_timeout < 0 || cfg.query_timeout < 0 || cfg.max_message < 0 { return errors.New("pg: negative connect_timeout, query_timeout or max_message") }
+  serr := check_sslmode(cfg.sslmode)
+  if serr != nil { return serr }
+  _, aerr := auth_methods(cfg.require_auth, false)
+  if aerr != nil { return aerr }
+  return nil
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -185,9 +301,15 @@ fn int16(b: *strings.Builder, v: int) {
   b.write_byte(v & 255)
 }
 
+# a NUL-terminated string; callers make sure s has no NUL of its own (check_nul, validate)
 fn cstr(b: *strings.Builder, s: str) {
   b.write(s)
   b.write_byte(0)
+}
+
+fn check_nul(what: str, s: str) -> error {
+  if strings.contains(s, "\x00") { return errors.New("pg: a NUL byte in the " + what) }
+  return nil
 }
 
 # a message: its type byte, its length (counting itself) and its body
@@ -199,13 +321,85 @@ export fn message(kind: int, body: str) -> str {
   return b.string()
 }
 
-fn get32(s: str, i: int) -> int {
-  v := (int(s[i]) << 24) | (int(s[i + 1]) << 16) | (int(s[i + 2]) << 8) | int(s[i + 3])
-  if v >= 0x80000000 { v -= 0x100000000 }
+# ---------------------------------------------------------------------------------------------
+# Messages: reading. Every read is checked against the end of the body: a short or lying
+# message sets bad instead of reading past it.
+
+struct Reader {
+  s: str
+  i: int
+  bad: bool
+}
+
+fn reader(s: str) -> *Reader { return &Reader{s: s} }
+
+fn (r: *Reader) left() -> int { return len(r.s) - r.i }
+
+fn (r: *Reader) u8() -> int {
+  if r.left() < 1 {
+    r.bad = true
+    return 0
+  }
+  v := int(r.s[r.i])
+  r.i++
   return v
 }
 
-fn get16(s: str, i: int) -> int { return (int(s[i]) << 8) | int(s[i + 1]) }
+fn (r: *Reader) u16() -> int {
+  if r.left() < 2 {
+    r.bad = true
+    return 0
+  }
+  v := (int(r.s[r.i]) << 8) | int(r.s[r.i + 1])
+  r.i += 2
+  return v
+}
+
+# a signed 32-bit integer
+fn (r: *Reader) i32() -> int {
+  if r.left() < 4 {
+    r.bad = true
+    return 0
+  }
+  s := r.s
+  i := r.i
+  v := (int(s[i]) << 24) | (int(s[i + 1]) << 16) | (int(s[i + 2]) << 8) | int(s[i + 3])
+  if v >= 0x80000000 { v -= 0x100000000 }
+  r.i += 4
+  return v
+}
+
+fn (r: *Reader) take(n: int) -> str {
+  if n < 0 || n > r.left() {
+    r.bad = true
+    return ""
+  }
+  v := r.s[r.i:r.i + n]
+  r.i += n
+  return v
+}
+
+fn (r: *Reader) rest() -> str { return r.take(r.left()) }
+
+fn (r: *Reader) cstring() -> str {
+  if r.left() < 1 {
+    r.bad = true
+    return ""
+  }
+  e := strings.index_from(r.s, "\x00", r.i)
+  if e < 0 {
+    r.bad = true
+    return ""
+  }
+  v := r.s[r.i:e]
+  r.i = e + 1
+  return v
+}
+
+fn kind_name(kind: int) -> str {
+  if kind >= 33 && kind <= 126 { return "'" + strings.from_byte(kind) + "'" }
+  return str(kind)
+}
 
 # ---------------------------------------------------------------------------------------------
 # Values: Caju values as parameters (text format), and columns back to Caju values
@@ -282,12 +476,15 @@ fn attr(msg: str, key: str) -> str {
 # the client's final message and the signature the server must answer with, for the client's
 # first message (without its "n,," header) and the server's first message
 export fn scram_final(password: str, client_first_bare: str, server_first: str) -> (str, str, error) {
+  if attr(server_first, "m") != "" { return "", "", errors.New("pg: SCRAM: the server asks for an extension this client does not know") }
   nonce := attr(server_first, "r")
+  ours := attr(client_first_bare, "r")
+  if ours == "" || len(nonce) <= len(ours) || !strings.has_prefix(nonce, ours) { return "", "", errors.New("pg: SCRAM: the server's nonce does not extend ours") }
   salt, err := base64.decode(attr(server_first, "s"))
-  if err != nil { return "", "", errors.New("pg: SCRAM: bad salt") }
+  if err != nil || salt == "" { return "", "", errors.New("pg: SCRAM: bad salt") }
   iterations, ierr := strconv.atoi(attr(server_first, "i"))
   if ierr != nil || iterations < 1 { return "", "", errors.New("pg: SCRAM: bad iteration count") }
-  if !strings.has_prefix(nonce, attr(client_first_bare, "r")) { return "", "", errors.New("pg: SCRAM: the server's nonce does not extend ours") }
+  if iterations > MAX_SCRAM_ITERATIONS { return "", "", errors.New("pg: SCRAM: the server asks for " + str(iterations) + " iterations, more than the limit of " + str(MAX_SCRAM_ITERATIONS)) }
   salted := crypto.pbkdf2_sha256(password, salt, iterations, 32)
   client_key := crypto.hmac_sha256(salted, "Client Key")
   stored_key := crypto.sha256(client_key)
@@ -308,12 +505,20 @@ export struct Column {
 
 export struct Conn {
   sock: *net.Conn
+  tconn: *tls.Conn     # the TLS layer over sock, or nil
+  verified: bool       # TLS with the certificate and host name verified (verify-full)
   buf: *rawbytes.Buffer   # what the server sent and was not read yet, from pos
   pos: int
   status: int          # 'I' idle, 'T' in a transaction, 'E' in a failed transaction
   params: map[str]str  # the server's parameters (server_version, TimeZone...)
   pid: int
+  secret: int          # with pid, the key of a CancelRequest
   closed: bool
+  cfg: *Config
+  mode: str            # the sslmode this connection was made with
+  deadline: int        # os.nanotime() at which the current operation gives up (0: none)
+  sock_timeout: int    # the timeout set on the socket, in ms (-1: unknown)
+  max_message: int
 }
 
 export fn connect(dsn: str) -> (*Conn, error) {
@@ -323,12 +528,96 @@ export fn connect(dsn: str) -> (*Conn, error) {
 }
 
 export fn connect_config(cfg: *Config) -> (*Conn, error) {
+  verr := cfg.validate()
+  if verr != nil { return nil, verr }
+  mode := cfg.sslmode
+  if mode == "" { mode = "disable" }
+  c, err := dial(cfg, mode)
+  if err != nil && mode == "allow" {
+    # allow: without TLS first, with TLS if the server refuses that (SQLSTATE 28000)
+    pe, ok := err.(*PgError)
+    if ok && pe.code == "28000" { return dial(cfg, "require") }
+  }
+  return c, err
+}
+
+# a new socket to the server, with TLS as mode asks; c.deadline bounds the TLS handshake
+fn (c: *Conn) open(mode: str, dial_ms: int) -> error {
+  cfg := c.cfg
   # the host is an IPv4 address or a name (net.resolve: /etc/hosts, then DNS)
-  sock, err := net.dial_timeout(cfg.host, cfg.port, cfg.connect_timeout * 1000)
-  if err != nil { return nil, errors.New("pg: " + err.Error()) }
+  sock, err := net.dial_timeout(cfg.host, cfg.port, dial_ms)
+  if err != nil { return errors.New("pg: " + err.Error()) }
   sock.set_nodelay()
-  c := &Conn{sock: sock, params: map[str]str{}, status: 'I', buf: rawbytes.new_buffer(65536)}
-  # the startup message: protocol 3.0, then name/value pairs
+  c.sock = sock
+  c.sock_timeout = -1
+  if c.deadline == 0 { c.deadline = os.nanotime() + HANDSHAKE_SECONDS * 1000000000 }
+  if mode == "disable" || mode == "allow" { return nil }
+  # SSLRequest: the server answers with one byte, S (TLS follows) or N
+  b := &strings.Builder{}
+  int32(b, 80877103)
+  serr := c.send(message(0, b.string()))
+  if serr != nil { return serr }
+  perr := c.prepare_io()
+  if perr != nil { return perr }
+  answer, rerr := sock.read(1)
+  if rerr != nil {
+    c.drop()
+    return errors.New("pg: " + rerr.Error())
+  }
+  if answer == "N" {
+    if mode == "prefer" { return nil }
+    c.drop()
+    return errors.New("pg: the server does not accept TLS (sslmode=" + mode + ")")
+  }
+  if answer != "S" {
+    c.drop()
+    return errors.New("pg: protocol error: unexpected answer to the TLS request")
+  }
+  # anything already waiting came from before the handshake, unencrypted (CVE-2021-23222)
+  if sock.readable() {
+    c.drop()
+    return errors.New("pg: protocol error: the server sent data before the TLS handshake")
+  }
+  ms := (c.deadline - os.nanotime()) / 1000000
+  if ms < 1 { ms = 1 }
+  tcfg := &tls.Config{timeout_ms: ms}
+  if mode == "verify-full" {
+    if cfg.sslrootcert != "" && cfg.sslrootcert != "system" {
+      roots, lerr := x509.load_roots(cfg.sslrootcert)
+      if lerr != nil {
+        c.drop()
+        return errors.New("pg: sslrootcert: " + lerr.Error())
+      }
+      tcfg.roots = roots
+    }
+  } else {
+    # require, prefer, allow: encrypted, but anyone in the middle can present a certificate
+    tcfg.insecure_skip_verify = true
+  }
+  t, terr := tls.client(sock, cfg.host, tcfg)
+  if terr != nil {
+    c.drop()
+    return errors.New("pg: " + terr.Error())
+  }
+  c.tconn = t
+  c.sock_timeout = -1
+  c.verified = mode == "verify-full"
+  return nil
+}
+
+fn dial(cfg: *Config, mode: str) -> (*Conn, error) {
+  max := cfg.max_message
+  if max == 0 { max = DEFAULT_MAX_MESSAGE }
+  c := &Conn{cfg: cfg, mode: mode, params: map[str]str{}, status: 'I', buf: rawbytes.new_buffer(65536), max_message: max}
+  if cfg.connect_timeout > 0 { c.deadline = os.nanotime() + cfg.connect_timeout * 1000000000 }
+  oerr := c.open(mode, cfg.connect_timeout * 1000)
+  if oerr != nil { return nil, oerr }
+  allowed, aerr := auth_methods(cfg.require_auth, c.verified)
+  if aerr != nil {
+    c.drop()
+    return nil, aerr
+  }
+  # the startup message: protocol 3.0, then name/value pairs (validate() refused NUL bytes)
   b := &strings.Builder{}
   int32(b, 196608)
   cstr(b, "user")
@@ -341,23 +630,92 @@ export fn connect_config(cfg: *Config) -> (*Conn, error) {
   cstr(b, "UTF8")
   b.write_byte(0)
   werr := c.send(message(0, b.string()))
-  if werr != nil { return nil, werr }
-  aerr := c.authenticate(cfg)
-  if aerr != nil {
-    c.close()
-    return nil, aerr
+  if werr != nil {
+    c.drop()
+    return nil, werr
   }
+  err := c.authenticate(allowed)
+  if err != nil {
+    c.close()
+    return nil, err
+  }
+  c.deadline = 0
   return c, nil
+}
+
+# the socket's timeout for the next read or write, from the deadline
+fn (c: *Conn) prepare_io() -> error {
+  ms := 0
+  if c.deadline != 0 {
+    ms = (c.deadline - os.nanotime()) / 1000000
+    if ms <= 0 { return c.timed_out() }
+  }
+  if ms != c.sock_timeout {
+    if c.tconn != nil { c.tconn.set_timeout(ms) } else { c.sock.set_timeout(ms) }
+    c.sock_timeout = ms
+  }
+  return nil
+}
+
+# the operation took too long: cancel what the server is running and drop the connection (its
+# stream is in an unknown state)
+fn (c: *Conn) timed_out() -> error {
+  if c.pid != 0 && !c.closed { c.cancel() }
+  c.drop()
+  return errors.New("pg: timed out (the connection was closed)")
+}
+
+fn (c: *Conn) protocol_error(what: str) -> error {
+  c.drop()
+  return errors.New("pg: protocol error: " + what + " (the connection was closed)")
+}
+
+# closes the socket without a goodbye
+fn (c: *Conn) drop() {
+  if c.closed { return }
+  c.closed = true
+  if c.tconn != nil {
+    c.tconn.set_timeout(1000)
+    c.tconn.close()
+  } else if c.sock != nil {
+    c.sock.close()
+  }
+  c.buf.reset()
+  c.pos = 0
 }
 
 fn (c: *Conn) send(data: str) -> error {
   if c.closed { return errors.New("pg: the connection is closed") }
-  err := c.sock.write(data)
+  perr := c.prepare_io()
+  if perr != nil { return perr }
+  let err: error = nil
+  if c.tconn != nil { err = c.tconn.write(data) } else { err = c.sock.write(data) }
   if err != nil {
-    c.closed = true
-    return err
+    if strings.contains(err.Error(), "timed out") { return c.timed_out() }
+    c.drop()
+    return errors.New("pg: " + err.Error())
   }
   return nil
+}
+
+# what the server sent next (at most 64 KiB)
+fn (c: *Conn) read_more() -> (str, error) {
+  if c.closed { return "", errors.New("pg: the connection is closed") }
+  perr := c.prepare_io()
+  if perr != nil { return "", perr }
+  let more: str = ""
+  let err: error = nil
+  if c.tconn != nil { more, err = c.tconn.read(65536) } else { more, err = c.sock.read(65536) }
+  if err != nil {
+    if strings.contains(err.Error(), "timed out") { return "", c.timed_out() }
+    c.drop()
+    return "", errors.New("pg: " + err.Error())
+  }
+  if more == "" {
+    c.drop()
+    return "", errors.New("pg: the server closed the connection")
+  }
+  return more, nil
 }
 
 fn (c: *Conn) buf32(at: int) -> int {
@@ -367,24 +725,25 @@ fn (c: *Conn) buf32(at: int) -> int {
   return v
 }
 
-# the next message from the server: its type and body
+# the next message from the server: its type and body. Its length is checked before anything
+# is buffered for it: below 4 or above max_message closes the connection.
 fn (c: *Conn) receive() -> (int, str, error) {
-  while c.buf.len() - c.pos < 5 || c.buf.len() - c.pos < 1 + c.buf32(c.pos + 1) {
+  while true {
+    have := c.buf.len() - c.pos
+    if have >= 5 {
+      n := c.buf32(c.pos + 1)
+      if n < 4 { return 0, "", c.protocol_error("a message of length " + str(n)) }
+      if n > c.max_message { return 0, "", c.protocol_error("a message of " + str(n) + " bytes, more than max_message (" + str(c.max_message) + ")") }
+      if have >= 1 + n { break }
+    }
     if c.pos > 0 {
       rest := c.buf.slice(c.pos, c.buf.len())
       c.buf.reset()
       c.buf.write(rest)
       c.pos = 0
     }
-    more, err := c.sock.read(65536)
-    if err != nil {
-      c.closed = true
-      return 0, "", err
-    }
-    if more == "" {
-      c.closed = true
-      return 0, "", errors.New("pg: the server closed the connection")
-    }
+    more, err := c.read_more()
+    if err != nil { return 0, "", err }
     c.buf.write(more)
   }
   kind := c.buf.get(c.pos)
@@ -398,31 +757,85 @@ fn (c: *Conn) receive() -> (int, str, error) {
   return kind, body, nil
 }
 
-fn (c: *Conn) authenticate(cfg: *Config) -> error {
+fn method_name(m: int) -> str {
+  switch m {
+  case AUTH_NONE: return "none"
+  case AUTH_PASSWORD: return "password"
+  case AUTH_MD5: return "md5"
+  }
+  return "scram-sha-256"
+}
+
+fn refused(m: int) -> error {
+  what := "SCRAM-SHA-256"
+  switch m {
+  case AUTH_NONE: what = "no authentication (trust)"
+  case AUTH_PASSWORD: what = "the password in clear text"
+  case AUTH_MD5: what = "an md5 password"
+  }
+  return errors.New("pg: the server asked for " + what + ", which require_auth does not allow (add " + method_name(m) + " to require_auth to accept it)")
+}
+
+# the authentication exchange, up to ReadyForQuery. Only the methods in allowed are answered (a
+# password is never sent to a server that was not allowed to ask for it this way), a SCRAM
+# exchange must end with the server's verified signature, and AuthenticationOk must come before
+# anything else.
+fn (c: *Conn) authenticate(allowed: int) -> error {
+  cfg := c.cfg
+  method := 0          # the method the server asked for (AUTH_*)
+  scram := 0           # 1: first message sent, 2: final message sent, 3: the server's signature checked
   client_first := ""
   server_sig := ""
+  authed := false
   while true {
     kind, body, err := c.receive()
     if err != nil { return err }
+    r := reader(body)
     switch kind {
     case 'R':
-      code := get32(body, 0)
+      if authed { return c.protocol_error("an authentication request after AuthenticationOk") }
+      code := r.i32()
+      if r.bad { return c.protocol_error("a short authentication request") }
+      if code != 0 && code != 11 && code != 12 && method != 0 { return c.protocol_error("a second authentication request") }
       switch code {
       case 0:
-        if server_sig != "" { return errors.New("pg: SCRAM: the server did not prove it knows the password") }
+        if r.left() != 0 { return c.protocol_error("a malformed AuthenticationOk") }
+        if method == AUTH_SCRAM && scram != 3 { return errors.New("pg: SCRAM: the server ended the authentication without proving it knows the password") }
+        if method == 0 {
+          if (allowed & AUTH_NONE) == 0 { return refused(AUTH_NONE) }
+          method = AUTH_NONE
+        }
+        authed = true
       case 3:
+        if (allowed & AUTH_PASSWORD) == 0 { return refused(AUTH_PASSWORD) }
+        method = AUTH_PASSWORD
+        nerr := check_nul("password", cfg.password)
+        if nerr != nil { return nerr }
         b := &strings.Builder{}
         cstr(b, cfg.password)
         serr := c.send(message('p', b.string()))
         if serr != nil { return serr }
       case 5:
+        salt := r.take(4)
+        if r.bad || r.left() != 0 { return c.protocol_error("a malformed md5 request") }
+        if (allowed & AUTH_MD5) == 0 { return refused(AUTH_MD5) }
+        method = AUTH_MD5
         inner := crypto.md5_hex(cfg.password + cfg.user)
         b := &strings.Builder{}
-        cstr(b, "md5" + crypto.md5_hex(inner + body[4:8]))
+        cstr(b, "md5" + crypto.md5_hex(inner + salt))
         serr := c.send(message('p', b.string()))
         if serr != nil { return serr }
       case 10:
-        if !strings.contains(body, "SCRAM-SHA-256") { return errors.New("pg: the server asks for an authentication this client does not know") }
+        has_scram := false
+        while true {
+          mech := r.cstring()
+          if r.bad || mech == "" { break }
+          if mech == "SCRAM-SHA-256" { has_scram = true }
+        }
+        if r.bad || r.left() != 0 { return c.protocol_error("a malformed SASL request") }
+        if !has_scram { return errors.New("pg: the server asks for an authentication this client does not know") }
+        if (allowed & AUTH_SCRAM) == 0 { return refused(AUTH_SCRAM) }
+        method = AUTH_SCRAM
         raw, rerr := crypto.random_bytes(18)
         if rerr != nil { return rerr }
         client_first = "n=,r=" + base64.encode(raw)
@@ -433,48 +846,113 @@ fn (c: *Conn) authenticate(cfg: *Config) -> error {
         b.write(data)
         serr := c.send(message('p', b.string()))
         if serr != nil { return serr }
+        scram = 1
       case 11:
-        final, sig, ferr := scram_final(cfg.password, client_first, body[4:])
+        if method != AUTH_SCRAM || scram != 1 { return c.protocol_error("an unexpected SASLContinue") }
+        final, sig, ferr := scram_final(cfg.password, client_first, r.rest())
         if ferr != nil { return ferr }
         server_sig = sig
         serr := c.send(message('p', final))
         if serr != nil { return serr }
+        scram = 2
       case 12:
-        if attr(body[4:], "v") != server_sig { return errors.New("pg: SCRAM: the server's signature does not match") }
-        server_sig = ""
+        if method != AUTH_SCRAM || scram != 2 { return c.protocol_error("an unexpected SASLFinal") }
+        last := r.rest()
+        e := attr(last, "e")
+        if e != "" { return errors.New("pg: SCRAM: the server reports " + e) }
+        if !crypto.constant_time_eq(attr(last, "v"), server_sig) { return errors.New("pg: SCRAM: the server's signature does not match") }
+        scram = 3
       default:
         return errors.New("pg: unsupported authentication (code " + str(code) + ")")
       }
     case 'S':
-      c.parameter(body)
+      if !authed { return c.protocol_error("ParameterStatus before AuthenticationOk") }
+      perr := c.parameter(body)
+      if perr != nil { return perr }
     case 'K':
-      c.pid = get32(body, 0)
+      if !authed { return c.protocol_error("BackendKeyData before AuthenticationOk") }
+      c.pid = r.i32()
+      c.secret = r.i32()
+      if r.bad || r.left() != 0 { return c.protocol_error("a malformed BackendKeyData") }
     case 'E':
       return parse_error(body)
+    case 'N':
+      # a notice: nothing to do
     case 'Z':
-      c.status = int(body[0])
-      return nil
+      if !authed { return c.protocol_error("ReadyForQuery before AuthenticationOk") }
+      return c.ready(r)
+    default:
+      return c.protocol_error("unexpected message " + kind_name(kind) + " during startup")
     }
   }
   return nil
 }
 
-fn (c: *Conn) parameter(body: str) {
-  k := strings.index(body, "\x00")
-  if k < 0 { return }
-  v := body[k + 1:]
-  if strings.has_suffix(v, "\x00") { v = v[0:len(v) - 1] }
-  c.params[body[0:k]] = v
+# ReadyForQuery: the transaction status
+fn (c: *Conn) ready(r: *Reader) -> error {
+  st := r.u8()
+  if r.bad || r.left() != 0 || (st != 'I' && st != 'T' && st != 'E') { return c.protocol_error("a malformed ReadyForQuery") }
+  c.status = st
+  return nil
+}
+
+fn (c: *Conn) parameter(body: str) -> error {
+  r := reader(body)
+  k := r.cstring()
+  v := r.cstring()
+  if r.bad || r.left() != 0 { return c.protocol_error("a malformed ParameterStatus") }
+  c.params[k] = v
+  return nil
 }
 
 # a parameter the server reported: "server_version", "TimeZone", "server_encoding"...
 export fn (c: *Conn) parameter_status(name: str) -> str { return c.params[name] }
 
+# the server process serving this connection (pg_backend_pid())
+export fn (c: *Conn) backend_pid() -> int { return c.pid }
+
+# whether the connection is encrypted, and whether the server's certificate was verified
+export fn (c: *Conn) uses_tls() -> bool { return c.tconn != nil }
+export fn (c: *Conn) tls_verified() -> bool { return c.verified }
+
 export fn (c: *Conn) close() {
   if c.closed { return }
-  c.sock.write(message('X', ""))
-  c.sock.close()
   c.closed = true
+  bye := message('X', "")
+  if c.tconn != nil {
+    c.tconn.set_timeout(1000)
+    c.tconn.write(bye)
+    c.tconn.close()
+  } else {
+    c.sock.set_timeout(1000)
+    c.sock.write(bye)
+    c.sock.close()
+  }
+  c.buf.reset()
+  c.pos = 0
+}
+
+# asks the server, on a new connection, to cancel what this connection is running (a
+# CancelRequest with the key from BackendKeyData). The server does not answer; the running
+# statement fails with SQLSTATE 57014 if it was still running.
+export fn (c: *Conn) cancel() -> error {
+  if c.pid == 0 { return errors.New("pg: no key to cancel with (the server sent no BackendKeyData)") }
+  k := &Conn{cfg: c.cfg, params: map[str]str{}, buf: rawbytes.new_buffer(16), max_message: 16}
+  k.deadline = os.nanotime() + 5000000000
+  mode := "disable"
+  if c.tconn != nil {
+    mode = c.mode
+    if mode == "prefer" || mode == "allow" { mode = "require" }
+  }
+  oerr := k.open(mode, 5000)
+  if oerr != nil { return oerr }
+  b := &strings.Builder{}
+  int32(b, 80877102)
+  int32(b, c.pid)
+  int32(b, c.secret)
+  serr := k.send(message(0, b.string()))
+  k.drop()
+  return serr
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -582,60 +1060,109 @@ export fn (r: *Rows) maps() -> []map[str]any {
 # ---------------------------------------------------------------------------------------------
 # Queries
 
-# reads up to ReadyForQuery, collecting the rows of the (last) result and the first error
-fn (c: *Conn) collect() -> (*Rows, error) {
+# starts an operation: a connection that can still be used, and its deadline (query_timeout)
+fn (c: *Conn) arm() -> error {
+  if c.closed { return errors.New("pg: the connection is closed") }
+  c.deadline = 0
+  if c.cfg.query_timeout > 0 { c.deadline = os.nanotime() + c.cfg.query_timeout * 1000000000 }
+  return nil
+}
+
+# reads up to ReadyForQuery, collecting the rows of the (last) result and the first error.
+# extended: the statement went through the extended protocol (it matters for COPY).
+fn (c: *Conn) collect(extended: bool) -> (*Rows, error) {
   rows := &Rows{columns: []Column{}, data: [][]any{}, index: -1}
   let first_err: error = nil
+  described := false   # a RowDescription came for the current statement
+  copy_out := false
   while true {
     kind, body, err := c.receive()
     if err != nil { return nil, err }
+    r := reader(body)
     switch kind {
     case 'T':
-      rows.columns = []Column{}
-      rows.data = [][]any{}
-      n := get16(body, 0)
-      i := 2
+      n := r.u16()
+      cols := []Column{}
       for k := 0; k < n; k++ {
-        e := strings.index_from(body, "\x00", i)
-        name := body[i:e]
-        i = e + 1
-        oid := get32(body, i + 6)
-        i += 18
-        rows.columns = append(rows.columns, Column{name: name, oid: oid})
+        name := r.cstring()
+        r.take(6)          # the table's OID and the column's number
+        oid := r.i32()
+        r.take(8)          # the type's size and modifier, the format
+        if r.bad { break }
+        cols = append(cols, Column{name: name, oid: oid})
       }
+      if r.bad || r.left() != 0 { return nil, c.protocol_error("a malformed RowDescription") }
+      rows.columns = cols
+      rows.data = [][]any{}
+      described = true
     case 'D':
-      n := get16(body, 0)
-      i := 2
+      if !described { return nil, c.protocol_error("a DataRow without a RowDescription") }
+      n := r.u16()
+      if r.bad || n != len(rows.columns) { return nil, c.protocol_error("a DataRow with " + str(n) + " columns for a RowDescription with " + str(len(rows.columns))) }
       row := make([]any, n)
       for k := 0; k < n; k++ {
-        l := get32(body, i)
-        i += 4
-        if l < 0 {
+        l := r.i32()
+        if l == -1 {
           row[k] = nil
         } else {
-          row[k] = decode(body[i:i + l], rows.columns[k].oid)
-          i += l
+          v := r.take(l)
+          if r.bad { break }
+          row[k] = decode(v, rows.columns[k].oid)
         }
       }
+      if r.bad || r.left() != 0 { return nil, c.protocol_error("a malformed DataRow") }
       rows.data = append(rows.data, row)
     case 'C':
-      rows.tag = body[0:len(body) - 1]
+      tag := r.cstring()
+      if r.bad { return nil, c.protocol_error("a malformed CommandComplete") }
+      rows.tag = tag
+      described = false
+      copy_out = false
     case 'E':
       if first_err == nil { first_err = parse_error(body) }
     case 'S':
-      c.parameter(body)
+      perr := c.parameter(body)
+      if perr != nil { return nil, perr }
     case 'Z':
-      c.status = int(body[0])
+      rerr := c.ready(r)
+      if rerr != nil { return nil, rerr }
       if first_err != nil { return nil, first_err }
       return rows, nil
+    case 'G':
+      # COPY ... FROM STDIN: the server waits for data; CopyFail ends it with an error. In the
+      # extended protocol the server ignored our Sync while copying, so it needs another.
+      if first_err == nil { first_err = errors.New("pg: COPY ... FROM STDIN is not supported") }
+      f := &strings.Builder{}
+      cstr(f, "COPY FROM STDIN is not supported by this client")
+      out := message('f', f.string())
+      if extended { out = out + message('S', "") }
+      serr := c.send(out)
+      if serr != nil { return nil, serr }
+    case 'H':
+      # COPY ... TO STDOUT: the data is skipped up to CommandComplete
+      if first_err == nil { first_err = errors.New("pg: COPY ... TO STDOUT is not supported") }
+      copy_out = true
+    case 'd', 'c':
+      if !copy_out { return nil, c.protocol_error("COPY data outside a COPY") }
+    case 'W':
+      return nil, c.protocol_error("COPY BOTH (replication) is not supported")
+    case '1', '2', '3', 'n', 'I', 'N', 'A', 's', 't':
+      # ParseComplete, BindComplete, CloseComplete, NoData, EmptyQueryResponse, notices,
+      # notifications, PortalSuspended, ParameterDescription: nothing to do
+    default:
+      return nil, c.protocol_error("unexpected message " + kind_name(kind))
     }
-    # '1' ParseComplete, '2' BindComplete, 'n' NoData, 'I' empty query, 'N' notices: nothing
   }
   return rows, nil
 }
 
 # the extended protocol: Parse, Bind (the arguments as text), Describe, Execute, Sync
 fn (c: *Conn) extended(sql: str, args: []any) -> (*Rows, error) {
+  aerr := c.arm()
+  if aerr != nil { return nil, aerr }
+  nerr := check_nul("SQL", sql)
+  if nerr != nil { return nil, nerr }
+  if len(args) > 65535 { return nil, errors.New("pg: too many arguments (" + str(len(args)) + "; at most 65535)") }
   out := &strings.Builder{}
   p := &strings.Builder{}
   cstr(p, "")
@@ -666,7 +1193,7 @@ fn (c: *Conn) extended(sql: str, args: []any) -> (*Rows, error) {
   out.write(message('S', ""))
   err := c.send(out.string())
   if err != nil { return nil, err }
-  return c.collect()
+  return c.collect(true)
 }
 
 # runs a query and returns its rows; $1, $2... are the arguments
@@ -680,22 +1207,54 @@ export fn (c: *Conn) query_row(sql: str, args: []any) -> (*Rows, error) {
   return rows, nil
 }
 
-# runs a statement and returns how many rows it changed; without arguments, sql may have several
-# statements separated by ";" (the simple protocol)
+# runs one statement and returns how many rows it changed. Always the extended protocol, with
+# or without arguments: sql is a single statement (for several, see exec_script).
 export fn (c: *Conn) exec(sql: str, args: []any) -> (*Result, error) {
-  let rows: *Rows = nil
-  let err: error = nil
-  if len(args) == 0 {
-    b := &strings.Builder{}
-    cstr(b, sql)
-    serr := c.send(message('Q', b.string()))
-    if serr != nil { return nil, serr }
-    rows, err = c.collect()
-  } else {
-    rows, err = c.extended(sql, args)
-  }
+  rows, err := c.extended(sql, args)
   if err != nil { return nil, err }
   return &Result{rows_affected: tag_count(rows.tag), tag: rows.tag}, nil
+}
+
+# runs a script: several statements separated by ";", without arguments (the simple protocol),
+# as in migrations. Never build sql out of untrusted input: that is SQL injection. The result is
+# the last statement's.
+export fn (c: *Conn) exec_script(sql: str) -> (*Result, error) {
+  aerr := c.arm()
+  if aerr != nil { return nil, aerr }
+  nerr := check_nul("SQL", sql)
+  if nerr != nil { return nil, nerr }
+  b := &strings.Builder{}
+  cstr(b, sql)
+  serr := c.send(message('Q', b.string()))
+  if serr != nil { return nil, serr }
+  rows, err := c.collect(false)
+  if err != nil { return nil, err }
+  return &Result{rows_affected: tag_count(rows.tag), tag: rows.tag}, nil
+}
+
+# puts a connection back to how it was after connecting: rolls back a transaction left open,
+# then DISCARD ALL (settings, SET ROLE, prepared statements, temporary tables, LISTEN) and
+# pg_advisory_unlock_all(). An error means the connection should not be reused.
+export fn (c: *Conn) reset() -> error {
+  aerr := c.arm()
+  if aerr != nil { return aerr }
+  out := ""
+  n := 2
+  if c.in_transaction() {
+    out = message('Q', "ROLLBACK\x00")
+    n = 3
+  }
+  out = out + message('Q', "DISCARD ALL\x00") + message('Q', "SELECT pg_advisory_unlock_all()\x00")
+  serr := c.send(out)
+  if serr != nil { return serr }
+  let first: error = nil
+  for i := 0; i < n; i++ {
+    _, err := c.collect(false)
+    if err != nil && first == nil { first = err }
+    if c.closed { break }
+  }
+  if first == nil && c.status != 'I' { first = errors.New("pg: the connection is not idle after a reset") }
+  return first
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -747,6 +1306,12 @@ export struct Pool {
 export fn open(dsn: str, max: int) -> (*Pool, error) {
   cfg, err := parse_dsn(dsn)
   if err != nil { return nil, err }
+  return open_config(cfg, max)
+}
+
+export fn open_config(cfg: *Config, max: int) -> (*Pool, error) {
+  verr := cfg.validate()
+  if verr != nil { return nil, verr }
   if max < 1 { max = 1 }
   return &Pool{cfg: cfg, max: max, idle: []*Conn{}}, nil
 }
@@ -766,14 +1331,19 @@ export fn (p: *Pool) acquire() -> (*Conn, error) {
   return c, nil
 }
 
-# gives a connection back (rolled back if a transaction was left open)
+# gives a connection back. It is reset first (c.reset(): a transaction left open is rolled back,
+# then DISCARD ALL and pg_advisory_unlock_all()), so the next caller gets a clean session; when
+# the reset fails or leaves it anything but idle, the connection is closed instead of kept.
 export fn (p: *Pool) release(c: *Conn) {
-  if c.closed {
-    p.open--
-    return
+  if !c.closed {
+    err := c.reset()
+    if err == nil && !c.closed && c.status == 'I' {
+      p.idle = append(p.idle, c)
+      return
+    }
+    c.close()
   }
-  if c.in_transaction() { c.rollback() }
-  p.idle = append(p.idle, c)
+  p.open--
 }
 
 export fn (p: *Pool) query(sql: str, args: []any) -> (*Rows, error) {

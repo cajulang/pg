@@ -1,11 +1,14 @@
 # Tests against a real PostgreSQL: PG_TEST_DSN=postgres://user:password@127.0.0.1:5432/db caju test
-# (tools/test-db.sh starts one in Docker). Without PG_TEST_DSN they are skipped.
+# (tools/test-db.sh starts one in Docker). Without PG_TEST_DSN they are skipped. The TLS tests
+# also need PG_TEST_ROOT, the CA of the server's certificate (tools/test-db.sh prints it); the
+# certificate must be valid for 127.0.0.1 and not for localhost.
 import { describe, it, skip, expect, before_each } from "std/testing"
 import "std/os"
 import "std/strings"
 import "pg"
 
 let DSN = os.getenv("PG_TEST_DSN")
+let ROOT = os.getenv("PG_TEST_ROOT")
 
 fn test(title: str, body: fn()) {
   if DSN == "" {
@@ -13,6 +16,26 @@ fn test(title: str, body: fn()) {
   } else {
     it(title, body)
   }
+}
+
+fn tls_test(title: str, body: fn()) {
+  if DSN == "" || ROOT == "" {
+    skip(title, body)
+  } else {
+    it(title, body)
+  }
+}
+
+fn config() -> *pg.Config {
+  cfg, err := pg.parse_dsn(DSN)
+  if err != nil { panic(err.Error()) }
+  return cfg
+}
+
+fn connect_with(cfg: *pg.Config) -> *pg.Conn {
+  c, err := pg.connect_config(cfg)
+  if err != nil { panic(err.Error()) }
+  return c
 }
 
 fn db() -> *pg.Conn {
@@ -25,7 +48,7 @@ describe("pg against PostgreSQL", fn() {
   before_each(fn() {
     if DSN == "" { return }
     c := db()
-    _, err := c.exec("drop table if exists caju_items; create table caju_items (id serial primary key, name text unique not null, price numeric(10,2), qty int, ok boolean, data bytea, meta jsonb, at timestamptz default now())", []any{})
+    _, err := c.exec_script("drop table if exists caju_items; create table caju_items (id serial primary key, name text unique not null, price numeric(10,2), qty int, ok boolean, data bytea, meta jsonb, at timestamptz default now())")
     if err != nil { panic(err.Error()) }
     c.close()
   })
@@ -98,11 +121,15 @@ describe("pg against PostgreSQL", fn() {
     c.close()
   })
 
-  test("runs several statements without arguments", fn() {
+  test("runs several statements with exec_script, and only one with exec", fn() {
     c := db()
-    res, err := c.exec("insert into caju_items (name) values ('a'); insert into caju_items (name) values ('b'); update caju_items set qty = 1", []any{})
+    res, err := c.exec_script("insert into caju_items (name) values ('a'); insert into caju_items (name) values ('b'); update caju_items set qty = 1")
     expect(err == nil).to_be_true()
     expect(res.rows_affected).to_equal(2)
+    _, eerr := c.exec("delete from caju_items; drop table caju_items", []any{})
+    expect(eerr.Error()).to_contain("42601")
+    row, _ := c.query_row("select count(*) as n from caju_items", []any{})
+    expect(row.get_int("n")).to_equal(2)
     c.close()
   })
 
@@ -160,5 +187,142 @@ describe("pg against PostgreSQL", fn() {
     expect(row.get_str("t")).to_equal("caju é 好")
     expect(row.get_int("n")).to_equal(8)
     c.close()
+  })
+
+  test("refuses md5 and clear text when the server asks for SCRAM and require_auth leaves it out", fn() {
+    cfg := config()
+    cfg.require_auth = "md5,password"
+    _, err := pg.connect_config(cfg)
+    expect(err.Error()).to_contain("SCRAM-SHA-256, which require_auth does not allow")
+  })
+
+  test("the pool gives back a clean session (DISCARD ALL, advisory locks)", fn() {
+    p, err := pg.open(DSN, 1)
+    expect(err == nil).to_be_true()
+    c, _ := p.acquire()
+    pid := c.backend_pid()
+    c.exec("set application_name = 'dirty'", []any{})
+    c.exec("set search_path = evil", []any{})
+    c.exec("create temp table caju_tmp (x int)", []any{})
+    c.exec("select pg_advisory_lock(4242)", []any{})
+    c.exec("prepare caju_stmt as select 1", []any{})
+    p.release(c)
+    d, _ := p.acquire()
+    expect(d.backend_pid()).to_equal(pid)
+    row, qerr := d.query_row("select current_setting('application_name') as app, current_setting('search_path') as sp, to_regclass('pg_temp.caju_tmp') is null as gone, (select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()) as locks, (select count(*) from pg_prepared_statements) as prepared", []any{})
+    expect(qerr == nil).to_be_true()
+    expect(row.get_str("app")).to_equal("caju-pg")
+    expect(row.get_str("sp")).to_equal("\"$user\", public")
+    expect(row.get_bool("gone")).to_be_true()
+    expect(row.get_int("locks")).to_equal(0)
+    expect(row.get_int("prepared")).to_equal(0)
+    p.release(d)
+    open, idle := p.stats()
+    expect(open).to_equal(1)
+    expect(idle).to_equal(1)
+    p.close()
+  })
+
+  test("refuses COPY and keeps the connection", fn() {
+    c := db()
+    _, err := c.query("copy caju_items (name) from stdin", []any{})
+    expect(err).to_be_error("pg: COPY ... FROM STDIN is not supported")
+    _, err = c.exec_script("copy caju_items (name) from stdin")
+    expect(err).to_be_error("pg: COPY ... FROM STDIN is not supported")
+    c.exec("insert into caju_items (name) values ($1)", []any{"x"})
+    _, err = c.query("copy caju_items (name) to stdout", []any{})
+    expect(err).to_be_error("pg: COPY ... TO STDOUT is not supported")
+    row, rerr := c.query_row("select count(*) as n from caju_items", []any{})
+    expect(rerr == nil).to_be_true()
+    expect(row.get_int("n")).to_equal(1)
+    c.close()
+  })
+
+  test("cancels a query that runs past query_timeout", fn() {
+    cfg := config()
+    cfg.query_timeout = 1
+    c := connect_with(cfg)
+    pid := c.backend_pid()
+    t := os.nanotime()
+    _, err := c.query("select pg_sleep(30)", []any{})
+    expect(err).to_be_error("pg: timed out (the connection was closed)")
+    expect((os.nanotime() - t) / 1000000).to_be_less_than(5000)
+    # the server stopped the statement (CancelRequest) and the session ended
+    other := db()
+    n := 1
+    for i := 0; i < 50 && n > 0; i++ {
+      row, _ := other.query_row("select count(*) as n from pg_stat_activity where pid = $1", []any{pid})
+      n = row.get_int("n")
+      if n > 0 { os.sleep(0.1) }
+    }
+    expect(n).to_equal(0)
+    other.close()
+  })
+
+  tls_test("sslmode=require encrypts without checking the certificate", fn() {
+    cfg := config()
+    cfg.sslmode = "require"
+    c := connect_with(cfg)
+    expect(c.uses_tls()).to_be_true()
+    expect(c.tls_verified()).to_be_false()
+    row, _ := c.query_row("select ssl from pg_stat_ssl where pid = pg_backend_pid()", []any{})
+    expect(row.get_bool("ssl")).to_be_true()
+    rows, err := c.query("select g as n, repeat('caju', 50) as s from generate_series(1, 20000) g", []any{})
+    expect(err == nil).to_be_true()
+    expect(rows.len()).to_equal(20000)
+    c.close()
+  })
+
+  tls_test("sslmode=verify-full checks the chain and the host name", fn() {
+    cfg := config()
+    cfg.sslmode = "verify-full"
+    cfg.sslrootcert = ROOT
+    c := connect_with(cfg)
+    expect(c.uses_tls()).to_be_true()
+    expect(c.tls_verified()).to_be_true()
+    row, _ := c.query_row("select ssl from pg_stat_ssl where pid = pg_backend_pid()", []any{})
+    expect(row.get_bool("ssl")).to_be_true()
+    c.close()
+    wrong := config()
+    wrong.sslmode = "verify-full"
+    wrong.sslrootcert = ROOT
+    wrong.host = "localhost"
+    _, err := pg.connect_config(wrong)
+    expect(err.Error()).to_contain("not localhost")
+    untrusted := config()
+    untrusted.sslmode = "verify-full"
+    _, err = pg.connect_config(untrusted)
+    expect(err != nil).to_be_true()
+  })
+
+  tls_test("sslmode=prefer uses TLS when the server has it; allow does not ask", fn() {
+    cfg := config()
+    cfg.sslmode = "prefer"
+    c := connect_with(cfg)
+    expect(c.uses_tls()).to_be_true()
+    c.close()
+    cfg.sslmode = "allow"
+    d := connect_with(cfg)
+    expect(d.uses_tls()).to_be_false()
+    d.close()
+  })
+
+  tls_test("cancels over TLS too", fn() {
+    cfg := config()
+    cfg.sslmode = "require"
+    cfg.query_timeout = 1
+    c := connect_with(cfg)
+    pid := c.backend_pid()
+    _, err := c.query("select pg_sleep(30)", []any{})
+    expect(err).to_be_error("pg: timed out (the connection was closed)")
+    other := db()
+    n := 1
+    for i := 0; i < 50 && n > 0; i++ {
+      row, _ := other.query_row("select count(*) as n from pg_stat_activity where pid = $1", []any{pid})
+      n = row.get_int("n")
+      if n > 0 { os.sleep(0.1) }
+    }
+    expect(n).to_equal(0)
+    other.close()
   })
 })

@@ -11,7 +11,7 @@ if err != nil {
 }
 print("connected to PostgreSQL", db.parameter_status("server_version"))
 
-db.exec("drop table if exists fruits; create table fruits (id serial primary key, name text not null, price numeric(6,2), ripe boolean)", []any{})
+db.exec_script("drop table if exists fruits; create table fruits (id serial primary key, name text not null, price numeric(6,2), ripe boolean)")
 for _, f := range [][]any{[]any{"caju", "4.50", true}, []any{"manga", "3.20", false}, []any{"acerola", nil, true}} {
   db.exec("insert into fruits (name, price, ripe) values ($1, $2, $3)", f)
 }

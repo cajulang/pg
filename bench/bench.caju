@@ -7,7 +7,7 @@ t0 := t()
 c, err := pg.connect(dsn)
 if err != nil { panic(err.Error()) }
 connect := t() - t0
-c.exec("drop table if exists bench; create table bench (id int primary key, name text, price float8)", []any{})
+c.exec_script("drop table if exists bench; create table bench (id int primary key, name text, price float8)")
 t0 = t()
 c.begin()
 for i := 0; i < 1000; i++ { c.exec("insert into bench values ($1, $2, $3)", []any{i, "item " + str(i), num(i) * 1.5}) }

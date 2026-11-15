@@ -35,8 +35,20 @@ describe("pg.parse_dsn", fn() {
     expect(err).to_be_error("pg: bad connect_timeout \"soon\"")
   })
   it("refuses TLS modes it cannot do", fn() {
-    _, err := pg.parse_dsn("postgres://a@h/db?sslmode=require")
+    _, err := pg.parse_dsn("postgres://a@h/db?sslmode=verify-ca")
     expect(err != nil).to_equal(true)
+  })
+  it("reads the TLS, authentication and limit settings", fn() {
+    c, err := pg.parse_dsn("postgres://a@h/db?sslmode=verify-full&sslrootcert=/etc/ca.pem&require_auth=scram-sha-256,md5&query_timeout=30&max_message=1000000")
+    expect(err == nil).to_equal(true)
+    expect(c.sslmode).to_equal("verify-full")
+    expect(c.sslrootcert).to_equal("/etc/ca.pem")
+    expect(c.require_auth).to_equal("scram-sha-256,md5")
+    expect(c.query_timeout).to_equal(30)
+    expect(c.max_message).to_equal(1000000)
+    d, _ := pg.parse_dsn("host=h user=a")
+    expect(d.sslmode).to_equal("disable")
+    expect(d.require_auth).to_equal("")
   })
 })
 
@@ -93,6 +105,16 @@ describe("SCRAM-SHA-256", fn() {
   })
   it("refuses a server nonce that does not extend the client's", fn() {
     _, _, err := pg.scram_final("pencil", "n=user,r=abc", "r=xyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    expect(err != nil).to_equal(true)
+    _, _, err = pg.scram_final("pencil", "n=user,r=abc", "r=abc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    expect(err).to_be_error("pg: SCRAM: the server's nonce does not extend ours")
+  })
+  it("refuses more iterations than MAX_SCRAM_ITERATIONS, an empty salt and unknown extensions", fn() {
+    _, _, err := pg.scram_final("pencil", "n=,r=abc", "r=abcd,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=600001")
+    expect(err).to_be_error("pg: SCRAM: the server asks for 600001 iterations, more than the limit of 600000")
+    _, _, err = pg.scram_final("pencil", "n=,r=abc", "r=abcd,s=,i=4096")
+    expect(err).to_be_error("pg: SCRAM: bad salt")
+    _, _, err = pg.scram_final("pencil", "n=,r=abc", "m=ext,r=abcd,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
     expect(err != nil).to_equal(true)
   })
 })

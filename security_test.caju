@@ -1,0 +1,445 @@
+# The client against a hostile or broken server: testdata/fake_server.caju, started in the
+# background. Each test names a database (its tag): the server logs what it received there.
+import { describe, it, expect } from "std/testing"
+import "std/os"
+import "std/net"
+import "std/strings"
+import "pg"
+
+# below 32768, apart from the ports Linux gives to outgoing connections
+let base_port: int = 22000 + os.getpid() % 5000
+let pids = []str{}
+
+fn tmp() -> str {
+  t := os.getenv("TMPDIR")
+  if t == "" { t = "/tmp" }
+  return t + "/caju-pg-test-" + str(os.getpid())
+}
+
+fn logdir() -> str { return tmp() + "/log" }
+
+# builds and starts a fake server on port with $SSL = ssl, and waits until it accepts
+fn start(port: int, ssl: str) {
+  if !os.exists(tmp() + "/fake") {
+    os.mkdir(tmp(), 0o755)
+    os.mkdir(logdir(), 0o755)
+    p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "-o", tmp() + "/fake", "testdata/fake_server.caju"}, nil, true)
+    if err != nil || p.code != 0 { panic("cannot build the fake server: " + p.output) }
+  }
+  env := "PORT=" + str(port) + " LOGDIR=" + logdir() + " SSL=" + ssl
+  p, err := os.run([]str{"sh", "-c", env + " " + tmp() + "/fake >/dev/null 2>&1 & echo $!"}, nil, false)
+  if err != nil { panic(err.Error()) }
+  pids = append(pids, strings.trim_space(p.output))
+  deadline := os.nanotime() + 20000000000
+  while os.nanotime() < deadline {
+    c, err2 := net.dial("127.0.0.1", port)
+    if err2 == nil {
+      # an empty connection: the server reads nothing and moves on
+      c.close()
+      return
+    }
+    os.sleep(0.02)
+  }
+  panic("the fake server did not start")
+}
+
+start(base_port, "N")
+start(base_port + 1, "inject")
+
+# a Config for the fake server: user picks how it authenticates, tag names the log
+fn cfg(user: str, tag: str) -> *pg.Config {
+  return &pg.Config{host: "127.0.0.1", port: base_port, user: user, password: "secret", database: tag, application_name: "t", connect_timeout: 5}
+}
+
+fn connect(user: str, tag: str, require_auth: str) -> (*pg.Conn, error) {
+  c := cfg(user, tag)
+  c.require_auth = require_auth
+  return pg.connect_config(c)
+}
+
+# a connection to the fake server that trusts (no password)
+fn trusted(tag: str) -> *pg.Conn {
+  c, err := connect("trust", tag, "none")
+  if err != nil { panic(err.Error()) }
+  return c
+}
+
+fn log_of(tag: str) -> str {
+  s, _ := os.read_file(logdir() + "/" + tag)
+  return s
+}
+
+# waits up to 5 s for text to show up in a log (the server writes it after the client moved on)
+fn wait_log(tag: str, text: str) -> str {
+  deadline := os.nanotime() + 5000000000
+  while os.nanotime() < deadline {
+    s := log_of(tag)
+    if strings.contains(s, text) { return s }
+    os.sleep(0.02)
+  }
+  return log_of(tag)
+}
+
+fn ms_since(t: int) -> int { return (os.nanotime() - t) / 1000000 }
+
+describe("authentication against a hostile server (M-3)", fn() {
+  it("does not send the password in clear text unless require_auth allows it", fn() {
+    _, err := connect("cleartext", "clear1", "")
+    expect(err.Error()).to_contain("the password in clear text, which require_auth does not allow")
+    expect(log_of("clear1")).not_().to_contain("password")
+    c, err2 := connect("cleartext", "clear2", "password")
+    expect(err2 == nil).to_be_true()
+    expect(log_of("clear2")).to_contain("password secret")
+    c.close()
+  })
+  it("does not answer an md5 request unless require_auth allows it", fn() {
+    _, err := connect("md5", "md5a", "")
+    expect(err.Error()).to_contain("an md5 password, which require_auth does not allow")
+    expect(log_of("md5a")).not_().to_contain("md5 md5")
+    c, err2 := connect("md5", "md5b", "scram-sha-256,md5")
+    expect(err2 == nil).to_be_true()
+    expect(log_of("md5b")).to_contain("md5 md5")
+    c.close()
+  })
+  it("refuses a server that asks for nothing unless require_auth has none", fn() {
+    _, err := connect("trust", "trust1", "")
+    expect(err.Error()).to_contain("no authentication (trust)")
+    c, err2 := connect("trust", "trust2", "none")
+    expect(err2 == nil).to_be_true()
+    c.close()
+  })
+  it("refuses SCRAM when require_auth leaves it out", fn() {
+    _, err := connect("scram", "scram0", "md5")
+    expect(err.Error()).to_contain("SCRAM-SHA-256, which require_auth does not allow")
+  })
+  it("logs in with SCRAM-SHA-256 and checks the server's signature", fn() {
+    c, err := connect("scram", "scram1", "")
+    expect(err == nil).to_be_true()
+    expect(c.parameter_status("server_version")).to_equal("17.0-fake")
+    c.close()
+    k := cfg("scram", "scram2")
+    k.password = "wrong"
+    _, err2 := pg.connect_config(k)
+    expect(err2.Error()).to_contain("28P01")
+  })
+  it("refuses AuthenticationOk before the SCRAM exchange is over", fn() {
+    _, err := connect("scram_ok_early", "early", "")
+    expect(err).to_be_error("pg: SCRAM: the server ended the authentication without proving it knows the password")
+    _, err2 := connect("scram_skip_final", "skip", "")
+    expect(err2).to_be_error("pg: SCRAM: the server ended the authentication without proving it knows the password")
+  })
+  it("refuses a wrong server signature", fn() {
+    _, err := connect("scram_badsig", "badsig", "")
+    expect(err).to_be_error("pg: SCRAM: the server's signature does not match")
+  })
+  it("refuses a server that offers only SCRAM-SHA-256-PLUS", fn() {
+    _, err := connect("scram_plus_only", "plus", "")
+    expect(err.Error()).to_contain("an authentication this client does not know")
+  })
+  it("refuses ReadyForQuery or BackendKeyData before AuthenticationOk, even with require_auth=none", fn() {
+    _, err := connect("ready_noauth", "noauth", "none")
+    expect(err.Error()).to_start_with("pg: protocol error: ReadyForQuery before AuthenticationOk")
+    _, err2 := connect("key_before_ok", "keyfirst", "none")
+    expect(err2.Error()).to_start_with("pg: protocol error: BackendKeyData before AuthenticationOk")
+  })
+  it("parses require_auth", fn() {
+    m, err := pg.auth_methods("", false)
+    expect(err == nil).to_be_true()
+    expect(m).to_equal(pg.AUTH_SCRAM)
+    m, err = pg.auth_methods("", true)
+    expect(m).to_equal(pg.AUTH_NONE | pg.AUTH_PASSWORD | pg.AUTH_MD5 | pg.AUTH_SCRAM)
+    m, err = pg.auth_methods("md5, scram-sha-256", false)
+    expect(m).to_equal(pg.AUTH_MD5 | pg.AUTH_SCRAM)
+    _, err = pg.auth_methods("gss", false)
+    expect(err != nil).to_be_true()
+    _, err = pg.parse_dsn("postgres://a@h/db?require_auth=kerberos")
+    expect(err != nil).to_be_true()
+    d, _ := pg.parse_dsn("postgres://a@h/db?require_auth=md5")
+    expect(d.require_auth).to_equal("md5")
+  })
+})
+
+describe("SCRAM iterations (M-4)", fn() {
+  it("refuses an iteration count above the limit without computing it", fn() {
+    t := os.nanotime()
+    _, err := connect("scram_iter", "iter", "")
+    expect(err.Error()).to_contain("100000000 iterations, more than the limit of 600000")
+    expect(ms_since(t)).to_be_less_than(2000)
+  })
+})
+
+describe("NUL bytes (M-1)", fn() {
+  it("refuses %00 in any DSN setting", fn() {
+    _, err := pg.parse_dsn("postgres://app@127.0.0.1/shop%00options%00-c%20search_path%3Devil")
+    expect(err).to_be_error("pg: a NUL byte in the setting \"dbname\"")
+    _, err = pg.parse_dsn("postgres://app%00x@127.0.0.1/shop")
+    expect(err).to_be_error("pg: a NUL byte in the setting \"user\"")
+    _, err = pg.parse_dsn("postgres://app:pw%00x@127.0.0.1/shop")
+    expect(err).to_be_error("pg: a NUL byte in the setting \"password\"")
+    _, err = pg.parse_dsn("postgres://app@127.0.0.1/shop?application_name=x%00options%00-c%20role%3Dadmin")
+    expect(err).to_be_error("pg: a NUL byte in the setting \"application_name\"")
+  })
+  it("refuses NUL bytes in a Config built by hand, before connecting", fn() {
+    c := cfg("trust", "nul")
+    c.database = "x\x00options\x00-c role=admin"
+    _, err := pg.connect_config(c)
+    expect(err).to_be_error("pg: a NUL byte in the setting \"dbname\"")
+    expect(log_of("nul")).to_equal("")
+  })
+  it("refuses unknown settings such as options", fn() {
+    _, err := pg.parse_dsn("postgres://a@h/db?options=-c%20search_path%3Devil")
+    expect(err).to_be_error("pg: unknown setting \"options\"")
+  })
+  it("refuses a NUL byte in SQL and keeps the connection", fn() {
+    c := trusted("nulsql")
+    _, err := c.query("select 1\x00; drop table x", []any{})
+    expect(err).to_be_error("pg: a NUL byte in the SQL")
+    _, err = c.exec_script("select 1\x00")
+    expect(err).to_be_error("pg: a NUL byte in the SQL")
+    rows, qerr := c.query("select 1", []any{})
+    expect(qerr == nil).to_be_true()
+    expect(rows.len()).to_equal(1)
+    c.close()
+  })
+})
+
+describe("DSN errors (M-2)", fn() {
+  it("never repeat the password", fn() {
+    dsns := []str{
+      "postgres://app:hunter2@db:notaport/shop",
+      "postgres://app:hunter2/shop",
+      "postgresql://app:hunter2@db:99999/shop",
+      "host=db password hunter2",
+      "host=db password=hunter2 x",
+      "postgres://app@db/shop?hunter2",
+    }
+    for _, d := range dsns {
+      _, err := pg.parse_dsn(d)
+      expect(err != nil).to_be_true()
+      expect(err.Error()).not_().to_contain("hunter2")
+    }
+    # a password with a space, in the key=value form: its second half looks like a key
+    _, err := pg.parse_dsn("host=db password=correct horse=battery")
+    expect(err).to_be_error("pg: unknown setting (not shown: only the names of settings libpq knows are)")
+  })
+})
+
+describe("message lengths (M-5)", fn() {
+  it("refuses a message above max_message before reading it", fn() {
+    c := trusted("huge")
+    t := os.nanotime()
+    _, err := c.query("huge", []any{})
+    expect(err.Error()).to_contain("a message of 2147483632 bytes, more than max_message (67108864)")
+    expect(ms_since(t)).to_be_less_than(2000)
+    _, err = c.query("select 1", []any{})
+    expect(err).to_be_error("pg: the connection is closed")
+  })
+  it("refuses a huge message during authentication", fn() {
+    _, err := connect("huge_auth", "hugeauth", "")
+    expect(err.Error()).to_contain("more than max_message")
+  })
+  it("takes max_message from the Config or the DSN", fn() {
+    k := cfg("trust", "small")
+    k.require_auth = "none"
+    k.max_message = 20
+    _, err := pg.connect_config(k)
+    expect(err.Error()).to_contain("more than max_message (20)")
+    d, _ := pg.parse_dsn("postgres://a@h/db?max_message=1048576")
+    expect(d.max_message).to_equal(1048576)
+  })
+})
+
+describe("malformed messages (M-6)", fn() {
+  it("turns each malformed answer into a protocol error that closes the connection", fn() {
+    cases := []str{"short", "negative", "wide row", "row overrun", "negative column", "row first", "short ready", "short key"}
+    wants := []str{
+      "a message of length 2",
+      "a message of length -16",
+      "a DataRow with 3 columns for a RowDescription with 1",
+      "a malformed DataRow",
+      "a malformed DataRow",
+      "a DataRow without a RowDescription",
+      "a malformed ReadyForQuery",
+      "unexpected message 'K'",
+    }
+    for i, sql := range cases {
+      c := trusted("malformed" + str(i))
+      _, err := c.query(sql, []any{})
+      expect(err != nil).to_be_true()
+      expect(err.Error()).to_start_with("pg: protocol error: " + wants[i])
+      _, err = c.query("select 1", []any{})
+      expect(err).to_be_error("pg: the connection is closed")
+    }
+  })
+  it("turns short and negative lengths during authentication into errors", fn() {
+    _, err := connect("short_auth", "shortauth", "")
+    expect(err.Error()).to_start_with("pg: protocol error: a short authentication request")
+    _, err = connect("negative_auth", "negauth", "")
+    expect(err.Error()).to_start_with("pg: protocol error: a message of length -1")
+  })
+})
+
+describe("the pool resets sessions (M-8)", fn() {
+  it("runs DISCARD ALL and pg_advisory_unlock_all() before reusing a connection", fn() {
+    p, _ := pg.open_config(cfg("trust", "pool1"), 1)
+    p.cfg.require_auth = "none"
+    _, err := p.exec("set role admin", []any{})
+    expect(err == nil).to_be_true()
+    _, err = p.exec("select 1", []any{})
+    expect(err == nil).to_be_true()
+    open, idle := p.stats()
+    expect(open).to_equal(1)
+    expect(idle).to_equal(1)
+    expect(log_of("pool1")).to_equal("startup user=trust database=pool1 application_name=t keys=4\nP set role admin\nQ DISCARD ALL\nQ SELECT pg_advisory_unlock_all()\nP select 1\nQ DISCARD ALL\nQ SELECT pg_advisory_unlock_all()\n")
+    p.close()
+  })
+  it("rolls back a transaction left open first", fn() {
+    p, _ := pg.open_config(cfg("trust", "pool2"), 1)
+    p.cfg.require_auth = "none"
+    c, _ := p.acquire()
+    c.begin()
+    p.release(c)
+    expect(log_of("pool2")).to_contain("P BEGIN\nQ ROLLBACK\nQ DISCARD ALL\n")
+    open, idle := p.stats()
+    expect(open).to_equal(1)
+    expect(idle).to_equal(1)
+    p.close()
+  })
+  it("closes a connection whose reset fails", fn() {
+    p, _ := pg.open_config(cfg("dirty_reset", "pool3"), 1)
+    p.cfg.require_auth = "none"
+    _, err := p.exec("select 1", []any{})
+    expect(err == nil).to_be_true()
+    open, idle := p.stats()
+    expect(open).to_equal(0)
+    expect(idle).to_equal(0)
+    p.close()
+  })
+  it("closes a connection that is not idle after the reset", fn() {
+    p, _ := pg.open_config(cfg("stuck_reset", "pool4"), 1)
+    p.cfg.require_auth = "none"
+    _, err := p.exec("select 1", []any{})
+    expect(err == nil).to_be_true()
+    open, idle := p.stats()
+    expect(open).to_equal(0)
+    expect(idle).to_equal(0)
+    p.close()
+  })
+})
+
+describe("timeouts, cancel and COPY (M-7)", fn() {
+  it("gives up on a query after query_timeout and sends a CancelRequest", fn() {
+    k := cfg("trust", "hang")
+    k.require_auth = "none"
+    k.query_timeout = 1
+    c, err := pg.connect_config(k)
+    if err != nil { panic(err.Error()) }
+    pid := c.backend_pid()
+    t := os.nanotime()
+    _, qerr := c.query("hang", []any{})
+    expect(qerr).to_be_error("pg: timed out (the connection was closed)")
+    expect(ms_since(t)).to_be_at_least(900)
+    expect(ms_since(t)).to_be_less_than(4000)
+    expect(wait_log("cancel", "cancel " + str(pid) + " 777")).to_contain("cancel " + str(pid) + " 777")
+    _, qerr = c.query("select 1", []any{})
+    expect(qerr).to_be_error("pg: the connection is closed")
+  })
+  it("gives up on a server that never answers the startup, after connect_timeout", fn() {
+    k := cfg("silent", "silent")
+    k.connect_timeout = 1
+    t := os.nanotime()
+    _, err := pg.connect_config(k)
+    expect(err).to_be_error("pg: timed out (the connection was closed)")
+    expect(ms_since(t)).to_be_less_than(4000)
+  })
+  it("cancels on request", fn() {
+    c := trusted("cancel1")
+    pid := c.backend_pid()
+    err := c.cancel()
+    expect(err == nil).to_be_true()
+    c.close()
+    expect(wait_log("cancel", "cancel " + str(pid) + " 777")).to_contain("cancel " + str(pid) + " 777")
+  })
+  it("ends COPY FROM STDIN with CopyFail and keeps the connection", fn() {
+    c := trusted("copyin")
+    _, err := c.query("copy in", []any{})
+    expect(err).to_be_error("pg: COPY ... FROM STDIN is not supported")
+    _, err = c.exec_script("copy in")
+    expect(err).to_be_error("pg: COPY ... FROM STDIN is not supported")
+    rows, qerr := c.query("select 1", []any{})
+    expect(qerr == nil).to_be_true()
+    expect(rows.len()).to_equal(1)
+    c.close()
+    expect(strings.count(log_of("copyin"), "CopyFail COPY FROM STDIN is not supported by this client")).to_equal(2)
+  })
+  it("skips the data of COPY TO STDOUT with an error and keeps the connection", fn() {
+    c := trusted("copyout")
+    _, err := c.query("copy out", []any{})
+    expect(err).to_be_error("pg: COPY ... TO STDOUT is not supported")
+    rows, qerr := c.query("select 1", []any{})
+    expect(qerr == nil).to_be_true()
+    expect(rows.len()).to_equal(1)
+    c.close()
+  })
+  it("closes the connection on COPY BOTH", fn() {
+    c := trusted("copyboth")
+    _, err := c.query("copy both", []any{})
+    expect(err.Error()).to_start_with("pg: protocol error: COPY BOTH")
+  })
+})
+
+describe("exec and exec_script (M-9)", fn() {
+  it("exec uses the extended protocol even without arguments; exec_script the simple one", fn() {
+    c := trusted("protocols")
+    res, err := c.exec("select 1", []any{})
+    expect(err == nil).to_be_true()
+    expect(res.tag).to_equal("SELECT 1")
+    res, err = c.exec_script("select 1")
+    expect(err == nil).to_be_true()
+    expect(res.rows_affected).to_equal(1)
+    c.close()
+    expect(log_of("protocols")).to_contain("P select 1\nQ select 1\n")
+  })
+})
+
+describe("sslmode (M-10)", fn() {
+  it("refuses require and verify-full when the server has no TLS", fn() {
+    k := cfg("scram", "tls1")
+    k.sslmode = "require"
+    _, err := pg.connect_config(k)
+    expect(err).to_be_error("pg: the server does not accept TLS (sslmode=require)")
+    k.sslmode = "verify-full"
+    _, err = pg.connect_config(k)
+    expect(err).to_be_error("pg: the server does not accept TLS (sslmode=verify-full)")
+    expect(log_of("tls1")).to_equal("")
+  })
+  it("prefer asks for TLS and goes on without it when the server says no", fn() {
+    k := cfg("scram", "tls2")
+    k.sslmode = "prefer"
+    c, err := pg.connect_config(k)
+    expect(err == nil).to_be_true()
+    expect(c.uses_tls()).to_be_false()
+    c.close()
+  })
+  it("refuses bytes sent before the TLS handshake", fn() {
+    k := cfg("scram", "tls3")
+    k.port = base_port + 1
+    k.sslmode = "require"
+    _, err := pg.connect_config(k)
+    expect(err).to_be_error("pg: protocol error: the server sent data before the TLS handshake")
+  })
+  it("parses the modes and refuses verify-ca and unknown ones", fn() {
+    for _, m := range []str{"disable", "allow", "prefer", "require", "verify-full"} {
+      c, err := pg.parse_dsn("postgres://a@h/db?sslmode=" + m)
+      expect(err == nil).to_be_true()
+      expect(c.sslmode).to_equal(m)
+    }
+    _, err := pg.parse_dsn("postgres://a@h/db?sslmode=verify-ca")
+    expect(err.Error()).to_contain("use verify-full")
+    _, err = pg.parse_dsn("sslmode=sometimes")
+    expect(err != nil).to_be_true()
+  })
+})
+
+for _, pid := range pids { os.run([]str{"kill", pid}, nil, true) }
+os.run([]str{"rm", "-rf", tmp()}, nil, true)
